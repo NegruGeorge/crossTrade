@@ -1,8 +1,18 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useState, useMemo } from 'react'
 import { useWriteContract, useWaitForTransactionReceipt, useAccount, useChainId, useSwitchChain, useReadContract } from 'wagmi'
-import { PROVIDE_CT_ABI, getContractAddress, getAllChains } from '@/config/contracts'
+import { 
+  PROVIDE_CT_ABI, 
+  CHAIN_CONFIG_L2_L2,
+  CHAIN_CONFIG_L2_L1,
+  getTokenDecimals,
+  // L2_L2 specific imports
+  getContractAddressFor_L2_L2,
+  // L2_L1 specific imports
+  getContractAddressFor_L2_L1,
+  L2_L1_PROVIDE_CT_ABI
+} from '@/config/contracts'
 
 // ERC20 ABI for approve and allowance functions
 const ERC20_ABI = [
@@ -42,6 +52,7 @@ interface ReviewProvideModalProps {
     receiver: string
     totalAmount: bigint
     ctAmount: bigint
+    editedCtAmount?: bigint
     l1ChainId: bigint
     l2DestinationChainId: bigint
     hashValue: string
@@ -52,6 +63,7 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
   const [riskUnderstood, setRiskUnderstood] = useState(false)
   const [approvalStep, setApprovalStep] = useState<'checking' | 'needed' | 'approving' | 'approved'>('checking')
   const [isApprovalSuccess, setIsApprovalSuccess] = useState(false)
+  const [showSuccessModal, setShowSuccessModal] = useState(false)
   
   // Wagmi hooks for contract interaction
   const { writeContract, isPending, data: hash, error: writeError } = useWriteContract()
@@ -70,9 +82,37 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
   const chainId = useChainId()
   const { switchChain } = useSwitchChain()
 
-  // Get L1 contract address using the L1 chain ID from request data
+  // Detect communication mode based on destination chain
+  const communicationMode = useMemo((): 'L2_L2' | 'L2_L1' => {
+    const destinationChainId = Number(requestData.l2DestinationChainId)
+    const l1ChainId = 11155111 // Ethereum Sepolia
+    
+    // If destination is Ethereum (L1) → L2_L1, otherwise → L2_L2
+    return destinationChainId === l1ChainId ? 'L2_L1' : 'L2_L2'
+  }, [requestData.l2DestinationChainId])
+
+  // Get the correct ABI based on communication mode
+  const getProvideABI = () => {
+    return communicationMode === 'L2_L1' ? L2_L1_PROVIDE_CT_ABI : PROVIDE_CT_ABI
+  }
+
+  // Get L1 contract address using mode-aware configuration
   const l1ChainId = Number(requestData.l1ChainId)
-  const L1_CONTRACT_ADDRESS = getContractAddress(l1ChainId, 'L1_CROSS_TRADE')
+  const getL1ContractAddress = () => {
+    if (communicationMode === 'L2_L1') {
+      return getContractAddressFor_L2_L1(l1ChainId, 'l1_cross_trade')
+    } else {
+      return getContractAddressFor_L2_L2(l1ChainId, 'l1_cross_trade')
+    }
+  }
+  const L1_CONTRACT_ADDRESS = getL1ContractAddress()
+
+  console.log('🔵 ReviewProvideModal - Mode detection:', {
+    mode: communicationMode,
+    destinationChainId: requestData.l2DestinationChainId.toString(),
+    l1ContractAddress: L1_CONTRACT_ADDRESS,
+    abi: communicationMode === 'L2_L1' ? 'L2_L1_PROVIDE_CT_ABI' : 'PROVIDE_CT_ABI'
+  })
   
   // Check if it's an ETH transaction
   const isETH = requestData.l1token === '0x0000000000000000000000000000000000000000'
@@ -89,33 +129,39 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
     }
   })
 
-  // Get the edited CT amount from L1 contract
-  const { data: editedCtAmount, refetch: refetchEditedAmount } = useReadContract({
-    address: L1_CONTRACT_ADDRESS as `0x${string}`,
-    abi: [
-      {
-        inputs: [{ type: 'bytes32', name: '' }],
-        name: 'editCtAmount',
-        outputs: [{ type: 'uint256', name: '' }],
-        stateMutability: 'view',
-        type: 'function'
-      }
-    ] as const,
-    functionName: 'editCtAmount',
-    args: [requestData.hashValue as `0x${string}`],
-    chainId: l1ChainId,
-    query: {
-      enabled: !!L1_CONTRACT_ADDRESS && !!requestData.hashValue
-    }
-  })
+  // Use editedCtAmount from requestData (already fetched in RequestPool/History)
+  const editedCtAmount = requestData.editedCtAmount
 
   if (!isOpen) return null
   
 
   // Helper function to format token amounts with proper decimals
   const formatTokenAmount = (amount: bigint, tokenAddress: string) => {
-    // For demo purposes, using USDC (6 decimals)
-    const decimals = 6
+    let symbol = 'UNKNOWN'
+    let decimals = 18
+
+    // Check against known token addresses from both L2_L2 and L2_L1 configs
+    Object.entries(CHAIN_CONFIG_L2_L2).forEach(([chainId, config]) => {
+      Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+        if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
+          symbol = tokenSymbol
+          decimals = getTokenDecimals(tokenSymbol)
+        }
+      })
+    })
+    
+    // Also check L2_L1 config if not found
+    if (symbol === 'UNKNOWN') {
+      Object.entries(CHAIN_CONFIG_L2_L1).forEach(([chainId, config]) => {
+        Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+          if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
+            symbol = tokenSymbol
+            decimals = getTokenDecimals(tokenSymbol)
+          }
+        })
+      })
+    }
+
     const divisor = BigInt(10 ** decimals)
     const integerPart = amount / divisor
     const fractionalPart = amount % divisor
@@ -132,9 +178,10 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
   // Helper function to get chain name from chain ID
   const getChainName = (chainId: bigint) => {
     const chainIdNum = Number(chainId)
-    const allChains = getAllChains()
-    const chain = allChains.find(c => c.chainId === chainIdNum)
-    return chain ? chain.config.name : `Chain ${chainId}`
+    const chainIdStr = chainIdNum.toString()
+    // Try L2_L2 config first, then L2_L1
+    const config = CHAIN_CONFIG_L2_L2[chainIdStr] || CHAIN_CONFIG_L2_L1[chainIdStr]
+    return config?.name || `Chain ${chainId}`
   }
 
   // Helper function to get chain icon
@@ -149,18 +196,52 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
     }
   }
 
-  const provideAmount = formatTokenAmount(requestData.totalAmount, requestData.l2SourceToken)
-  const rewardAmount = formatTokenAmount(requestData.ctAmount, requestData.l2DestinationToken)
+  // Helper function to get token symbol from address
+  const getTokenSymbol = (tokenAddress: string) => {
+    let symbol = 'UNKNOWN'
+    // Check L2_L2 config
+    Object.entries(CHAIN_CONFIG_L2_L2).forEach(([chainId, config]) => {
+      Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+        if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
+          symbol = tokenSymbol
+        }
+      })
+    })
+    // Also check L2_L1 config if not found
+    if (symbol === 'UNKNOWN') {
+      Object.entries(CHAIN_CONFIG_L2_L1).forEach(([chainId, config]) => {
+        Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+          if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
+            symbol = tokenSymbol
+          }
+        })
+      })
+    }
+    return symbol
+  }
+
+  // Determine the actual ctAmount to use (edited if available, otherwise original)
+  const actualCtAmount = useMemo(() => {
+    if (editedCtAmount !== undefined && editedCtAmount > BigInt(0)) {
+      console.log('📝 Using edited ctAmount:', editedCtAmount.toString())
+      return editedCtAmount
+    }
+    return requestData.ctAmount
+  }, [editedCtAmount, requestData.ctAmount])
+
+  const provideAmount = formatTokenAmount(actualCtAmount, requestData.l2SourceToken)
+  const rewardAmount = formatTokenAmount(requestData.totalAmount, requestData.l2SourceToken)
   const provideChain = getChainName(BigInt(11155111)) // Always Ethereum for L1
   const rewardChain = getChainName(requestData.l2DestinationChainId)
   const sourceChain = requestData.chainName // Source chain from request data
+  const tokenSymbol = getTokenSymbol(requestData.l2SourceToken) // Get actual token symbol
 
   // Calculate cross chain path - source chain to destination chain
   const crossChainPath = `${sourceChain} → ${getChainName(requestData.l2DestinationChainId)}`
   const sendToAddress = requestData.receiver.slice(0, 6) + '...' + requestData.receiver.slice(-4)
   
-  // Check approval status
-  const needsApproval = !isETH && currentAllowance !== undefined && currentAllowance < requestData.ctAmount && !isApprovalSuccess
+  // Check approval status - use actualCtAmount (edited if available)
+  const needsApproval = !isETH && currentAllowance !== undefined && currentAllowance < actualCtAmount && !isApprovalSuccess
   
   // Auto-transition to approved state when approval transaction succeeds
   React.useEffect(() => {
@@ -173,6 +254,13 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
       }, 1000)
     }
   }, [isApprovalTxSuccess, approvalStep, refetchAllowance])
+
+  // Handle main transaction success
+  React.useEffect(() => {
+    if (isSuccess) {
+      setShowSuccessModal(true)
+    }
+  }, [isSuccess])
   
   // Handle approval function
   const handleApproval = async () => {
@@ -204,7 +292,7 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
         abi: ERC20_ABI,
         functionName: 'approve',
         chainId: l1ChainId,
-        args: [L1_CONTRACT_ADDRESS as `0x${string}`, requestData.ctAmount]
+        args: [L1_CONTRACT_ADDRESS as `0x${string}`, actualCtAmount]
       })
       
     } catch (error) {
@@ -249,36 +337,74 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
     }
     
     
-    // Use the editedCtAmount directly from L1 contract (0 means not edited, >0 means edited)
-    const finalEditedCtAmount = editedCtAmount !== undefined ? editedCtAmount : BigInt(0)
+    // Use the editedCtAmount from requestData (0 means not edited, >0 means edited)
+    const finalEditedCtAmount = editedCtAmount || BigInt(0)
     
-    // Contract arguments setup
+    // Use mode-aware ABI and arguments
+    const provideABI = getProvideABI()
+    const txValue = isETH ? actualCtAmount : BigInt(0)
     
-    const contractArgs = [
-      requestData.l1token as `0x${string}`,
-      requestData.l2SourceToken as `0x${string}`,
-      requestData.l2DestinationToken as `0x${string}`,
-      requestData.requester as `0x${string}`,
-      requestData.receiver as `0x${string}`,
-      requestData.totalAmount,
-      requestData.ctAmount,
-      finalEditedCtAmount, // _editedctAmount - from L1 contract or fallback to initial
-      BigInt(requestData.saleCount),
-      BigInt(requestData.chainId), // l2SourceChainId
-      requestData.l2DestinationChainId,
-      200000, // minGasLimit
-      requestData.hashValue as `0x${string}`
-    ] as const
+    // Build arguments based on communication mode
+    let contractArgs: any
     
+    if (communicationMode === 'L2_L2') {
+      // NEW contract (L2toL2CrossTradeL1.sol) - 13 params
+      // Note: We pass the ORIGINAL ctAmount from L2, and the contract will check editedCtAmount internally
+      contractArgs = [
+        requestData.l1token as `0x${string}`,
+        requestData.l2SourceToken as `0x${string}`,
+        requestData.l2DestinationToken as `0x${string}`,
+        requestData.requester as `0x${string}`,
+        requestData.receiver as `0x${string}`,
+        requestData.totalAmount,
+        requestData.ctAmount, // Original ctAmount from L2
+        finalEditedCtAmount, // _editedctAmount - contract will use this if > 0
+        BigInt(requestData.saleCount),
+        BigInt(requestData.chainId), // _l2SourceChainId
+        requestData.l2DestinationChainId, // _l2DestinationChainId
+        200000, // _minGasLimit
+        requestData.hashValue as `0x${string}`
+      ] as const
+    } else {
+      // OLD contract (L1CrossTrade.sol) - 11 params
+      // Note: We pass the ORIGINAL ctAmount from L2, and the contract will check editedCtAmount internally
+      contractArgs = [
+        requestData.l1token as `0x${string}`,
+        requestData.l2SourceToken as `0x${string}`, // Used as _l2token in OLD contract
+        requestData.requester as `0x${string}`,
+        requestData.receiver as `0x${string}`,
+        requestData.totalAmount,
+        requestData.ctAmount, // Original ctAmount from L2
+        finalEditedCtAmount, // _editedctAmount - contract will use this if > 0
+        BigInt(requestData.saleCount),
+        BigInt(requestData.chainId), // _l2chainId (source chain in OLD contract)
+        200000, // _minGasLimit
+        requestData.hashValue as `0x${string}`
+      ] as const
+    }
     
-    const txValue = isETH ? requestData.ctAmount : BigInt(0)
-    
+    console.log('🔵 ReviewProvideModal - Provide CT:', {
+      mode: communicationMode,
+      abi: communicationMode === 'L2_L1' ? 'L2_L1_PROVIDE_CT_ABI (11 params)' : 'PROVIDE_CT_ABI (13 params)',
+      l1ContractAddress: L1_CONTRACT_ADDRESS,
+      saleCount: requestData.saleCount,
+      sourceChainId: requestData.chainId,
+      destinationChainId: requestData.l2DestinationChainId.toString(),
+      argsCount: contractArgs.length,
+      amounts: {
+        totalAmount: requestData.totalAmount.toString(),
+        initialctAmount: requestData.ctAmount.toString(),
+        editedctAmount: finalEditedCtAmount.toString(),
+        actualAmountToSend: actualCtAmount.toString(),
+        isEdited: finalEditedCtAmount > BigInt(0)
+      }
+    })
     
     try {
       
       const result = await writeContract({
         address: L1_CONTRACT_ADDRESS as `0x${string}`,
-        abi: PROVIDE_CT_ABI,
+        abi: provideABI,
         functionName: 'provideCT',
         chainId: l1ChainId, // Use L1 chain ID from request data
         value: txValue,
@@ -299,7 +425,6 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
   
   // Network fee calculation (example)
   const networkFee = '0.0012 ETH'
-  const networkFeeUsd = '($0.67)'
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -312,20 +437,55 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
         </div>
 
         <div className="provide-details">
+          {/* Mode Indicator */}
+          <div style={{ 
+            padding: '10px 12px', 
+            marginBottom: '12px', 
+            borderRadius: '8px', 
+            backgroundColor: communicationMode === 'L2_L2' ? 'rgba(99, 102, 241, 0.1)' : 'rgba(34, 197, 94, 0.1)',
+            border: `1px solid ${communicationMode === 'L2_L2' ? 'rgba(99, 102, 241, 0.3)' : 'rgba(34, 197, 94, 0.3)'}`,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px'
+          }}>
+            <span style={{ fontSize: '13px', fontWeight: '600', color: '#ffffff' }}>
+              {communicationMode === 'L2_L2' ? '🔄 L2 ↔ L2 Mode' : '🌉 L2 ↔ L1 Mode'}
+            </span>
+            <span style={{ fontSize: '11px', color: 'rgba(255, 255, 255, 0.7)' }}>
+              {communicationMode === 'L2_L2' 
+                ? 'Using L2_L2 provide contract' 
+                : 'Using L2_L1 provide contract'}
+            </span>
+          </div>
+
           {/* Provide Chain Section */}
           <div className="chain-section">
             <div className="section-header">
               <span className="section-label">Provide Chain</span>
+              {actualCtAmount !== requestData.ctAmount && (
+                <span style={{ 
+                  fontSize: '11px', 
+                  color: '#f59e0b', 
+                  fontWeight: '600',
+                  marginLeft: '8px'
+                }}>
+                  📝 EDITED
+                </span>
+              )}
               <span className="help-icon">ⓘ</span>
             </div>
             <div className="amount-display">
-              <span className="amount-value">{provideAmount} USDC</span>
+              <span className="amount-value">{provideAmount} {tokenSymbol}</span>
               <div className="chain-badge">
                 <span className="chain-icon">{getChainIcon(provideChain)}</span>
               </div>
             </div>
             <div className="chain-name-display">{provideChain}</div>
-            <div className="amount-usd">($99.00)</div>
+            {actualCtAmount !== requestData.ctAmount && (
+              <div style={{ fontSize: '12px', color: '#9ca3af', marginTop: '4px' }}>
+                Original: {formatTokenAmount(requestData.ctAmount, requestData.l2SourceToken)} {tokenSymbol}
+              </div>
+            )}
           </div>
 
           {/* Reward Chain Section */}
@@ -335,14 +495,13 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
               <span className="help-icon">ⓘ</span>
             </div>
             <div className="amount-display">
-              <span className="amount-value">{rewardAmount} USDC</span>
+              <span className="amount-value">{rewardAmount} {tokenSymbol}</span>
               <div className="chain-badge reward">
                 <span className="chain-icon">{getChainIcon(rewardChain)}</span>
                 <span className="reward-symbol">🔥</span>
               </div>
             </div>
             <div className="chain-name-display">{rewardChain}</div>
-            <div className="amount-usd">($99.00)</div>
           </div>
 
           {/* Request Chain Section */}
@@ -352,22 +511,19 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
               <span className="help-icon">ⓘ</span>
             </div>
             <div className="amount-display">
-              <span className="amount-value">{provideAmount} USDC</span>
+              <span className="amount-value">{rewardAmount} {tokenSymbol}</span>
               <div className="chain-badge">
                 <span className="chain-icon">{getChainIcon(sourceChain)}</span>
               </div>
             </div>
             <div className="chain-name-display">{sourceChain}</div>
-            <div className="amount-usd">($99.00)</div>
           </div>
 
           {/* Cross Chain Path */}
           <div className="cross-chain-section">
             <div className="path-row">
               <span className="path-label">Cross Chain Path</span>
-              <div className="path-indicator">
-                <span className="path-badge">M</span>
-              </div>
+
               <span className="path-value">{crossChainPath}</span>
             </div>
             <div className="detail-row">
@@ -376,7 +532,7 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
             </div>
             <div className="detail-row">
               <span className="detail-label">Network fee</span>
-              <span className="detail-value">{networkFee} <span className="fee-usd">{networkFeeUsd}</span></span>
+              <span className="detail-value">{networkFee}</span>
             </div>
           </div>
 
@@ -433,6 +589,29 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
           </div>
         </div>
       </div>
+
+      {/* Success Modal */}
+      {showSuccessModal && (
+        <div className="success-modal-overlay" onClick={() => {
+          setShowSuccessModal(false)
+          onClose()
+        }}>
+          <div className="success-modal" onClick={(e) => e.stopPropagation()}>
+            <button onClick={() => {
+              setShowSuccessModal(false)
+              onClose()
+            }} className="close-btn-success">✕</button>
+            <h3>Transaction Confirmed!</h3>
+            <div className="success-checkmark">✓</div>
+            <p>Your provide transaction has been confirmed</p>
+            {hash && (
+              <div className="tx-hash">
+                <small>TX: {hash}</small>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <style jsx>{`
         .modal-overlay {
@@ -773,6 +952,88 @@ export const ReviewProvideModal = ({ isOpen, onClose, requestData }: ReviewProvi
 
         .approve-btn:hover:not(:disabled) {
           background: #d97706;
+        }
+
+        /* Success Modal Styles */
+        .success-modal-overlay {
+          position: fixed;
+          top: 0;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          background: rgba(0, 0, 0, 0.9);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 1001;
+        }
+
+        .success-modal {
+          background: #1a1a1a;
+          border: 1px solid #333;
+          border-radius: 16px;
+          padding: 32px;
+          text-align: center;
+          width: 90%;
+          max-width: 400px;
+          position: relative;
+        }
+
+        .close-btn-success {
+          position: absolute;
+          top: 12px;
+          right: 12px;
+          background: none;
+          border: none;
+          color: #9ca3af;
+          font-size: 20px;
+          cursor: pointer;
+          padding: 4px;
+          margin: 0;
+        }
+
+        .close-btn-success:hover {
+          color: #ffffff;
+        }
+
+        .success-modal h3 {
+          color: #ffffff;
+          font-size: 24px;
+          font-weight: 600;
+          margin: 0 0 24px 0;
+        }
+
+        .success-checkmark {
+          width: 48px;
+          height: 48px;
+          background: #10b981;
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          margin: 0 auto 24px auto;
+          color: #ffffff;
+          font-size: 24px;
+          font-weight: bold;
+        }
+
+        .success-modal p {
+          color: #9ca3af;
+          font-size: 16px;
+          margin: 0 0 16px 0;
+        }
+
+        .tx-hash {
+          margin-top: 16px;
+          padding: 8px;
+          background: #262626;
+          border-radius: 8px;
+          word-break: break-all;
+        }
+
+        .tx-hash small {
+          color: #9ca3af;
+          font-size: 12px;
         }
       `}</style>
     </div>

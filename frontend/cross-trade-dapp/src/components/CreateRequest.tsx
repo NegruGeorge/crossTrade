@@ -1,10 +1,24 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { useWriteContract, useWaitForTransactionReceipt, useAccount, useChainId, useSwitchChain } from 'wagmi'
-import { CONTRACTS, L2_CROSS_TRADE_ABI, CHAIN_CONFIG, CHAIN_IDS, getTokenAddress, getContractAddress } from '@/config/contracts'
+import { useWriteContract, useWaitForTransactionReceipt, useAccount, useChainId, useSwitchChain, useBalance, useReadContract } from 'wagmi'
+import { 
+  l2_cross_trade_ABI, 
+  // L2_L2 specific imports
+  getChainsFor_L2_L2,
+  getTokenAddressFor_L2_L2,
+  getContractAddressFor_L2_L2,
+  getAvailableTokensFor_L2_L2,
+  // L2_L1 specific imports
+  getChainsFor_L2_L1,
+  getTokenAddressFor_L2_L1,
+  getContractAddressFor_L2_L1,
+  getAvailableTokensFor_L2_L1,
+  // L2_L1 ABIs
+  L2_L1_REQUEST_ABI,
+} from '@/config/contracts'
 
-// ERC20 ABI for approve function
+// ERC20 ABI for approve and balanceOf functions
 const ERC20_ABI = [
   {
     "inputs": [
@@ -15,16 +29,25 @@ const ERC20_ABI = [
     "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
     "stateMutability": "nonpayable",
     "type": "function"
+  },
+  {
+    "inputs": [
+      {"internalType": "address", "name": "account", "type": "address"}
+    ],
+    "name": "balanceOf",
+    "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
   }
 ] as const
 
 export const CreateRequest = () => {
-  const [requestFrom, setRequestFrom] = useState('Optimism')
-  const [requestTo, setRequestTo] = useState('Thanos Sepolia')
+  const [requestFrom, setRequestFrom] = useState('')
+  const [requestTo, setRequestTo] = useState('')
   const [sendAmount, setSendAmount] = useState('')
-  const [sendToken, setSendToken] = useState('USDC') // Default to USDC
+  const [sendToken, setSendToken] = useState('eth') // Default to eth (lowercase to match config)
   const [receiveAmount, setReceiveAmount] = useState('')
-  const [receiveToken, setReceiveToken] = useState('USDC') // Default to USDC
+  // receiveToken is always the same as sendToken - no separate state needed
   const [toAddress, setToAddress] = useState('')
   const [serviceFeeMode, setServiceFeeMode] = useState('recommended') // 'recommended' or 'advanced'
   const [customFee, setCustomFee] = useState('')
@@ -34,6 +57,9 @@ export const CreateRequest = () => {
   const [isApproving, setIsApproving] = useState(false)
   const [approvalTxHash, setApprovalTxHash] = useState<string | undefined>()
   const [isTokenApproved, setIsTokenApproved] = useState(false) // Track if token is approved
+
+  // Native token address constant (0x0000... means native token - ETH, TON, etc.)
+  const NATIVE_TOKEN_ADDRESS = '0x0000000000000000000000000000000000000000'
 
   const { writeContract, data: hash, isPending, error: writeError } = useWriteContract()
   const { isLoading: isConfirming, isSuccess, isError: txError } = useWaitForTransactionReceipt({ hash })
@@ -56,16 +82,131 @@ export const CreateRequest = () => {
 
   // Helper function to get token decimals
   const getTokenDecimals = (tokenSymbol: string) => {
-    switch (tokenSymbol) {
-      case 'USDC':
-      case 'USDT':
+    const symbol = tokenSymbol.toLowerCase()
+    switch (symbol) {
+      case 'usdc':
+      case 'usdt':
         return 6 // USDC and USDT use 6 decimals
-      case 'ETH':
-      case 'TON':
+      case 'eth':
+      case 'ton':
       default:
         return 18 // ETH and most tokens use 18 decimals
     }
   }
+
+  // Get chain ID by display name (checks both L2_L2 and L2_L1 configs)
+  const getChainIdByName = (chainName: string): number => {
+    // Try L2_L2 first
+    let chains = getChainsFor_L2_L2()
+    let chain = chains.find(c => c.config.display_name === chainName)
+    if (chain) return chain.chainId
+    
+    // Try L2_L1 if not found
+    chains = getChainsFor_L2_L1()
+    chain = chains.find(c => c.config.display_name === chainName)
+    return chain?.chainId || 0
+  }
+
+  // Check if a chain is L1 (Ethereum)
+  // Known L1 chain IDs: Ethereum Sepolia (11155111) and Ethereum Mainnet (1)
+  const isL1Chain = (chainId: number): boolean => {
+    return chainId === 11155111 || chainId === 1
+  }
+
+  // Check if L2_L1 config is available (not empty)
+  const isL2L1ConfigAvailable = (): boolean => {
+    const l2l1Chains = getChainsFor_L2_L1()
+    return l2l1Chains && l2l1Chains.length > 0
+  }
+
+  // Automatically detect communication mode based on destination chain
+  // If destination is Ethereum (L1) → L2_L1, otherwise → L2_L2
+  const getCommunicationMode = (): 'L2_L2' | 'L2_L1' => {
+    // If no destination selected, default to L2_L2
+    if (!requestTo) return 'L2_L2'
+    
+    // Check if destination is L1 (Ethereum)
+    const toChainId = getChainIdByName(requestTo)
+    if (toChainId && isL1Chain(toChainId)) {
+      return 'L2_L1' // L2 source → L1 destination
+    }
+    
+    return 'L2_L2' // L2 source → L2 destination
+  }
+
+  const communicationMode = getCommunicationMode()
+
+  // Mode-aware helper functions
+  const getAvailableChains = () => {
+    // Always return all chains from both configs
+    const l2l2Chains = getChainsFor_L2_L2()
+    const l2l1Chains = getChainsFor_L2_L1()
+    
+    // Merge and remove duplicates by chain ID
+    const allChains = [...l2l2Chains, ...l2l1Chains]
+    const uniqueChains = allChains.filter((chain, index, self) => 
+      index === self.findIndex(c => c.chainId === chain.chainId)
+    )
+    
+    return uniqueChains
+  }
+
+  const getTokenAddressForMode = (chainId: number, tokenSymbol: string) => {
+    // Each mode strictly uses its own config - no fallbacks
+    if (communicationMode === 'L2_L2') {
+      return getTokenAddressFor_L2_L2(chainId, tokenSymbol)
+    } else {
+      return getTokenAddressFor_L2_L1(chainId, tokenSymbol)
+    }
+  }
+
+  const getContractAddressForMode = (chainId: number, contractName: string) => {
+    // Each mode strictly uses its own config - no fallbacks
+    if (communicationMode === 'L2_L2') {
+      return getContractAddressFor_L2_L2(chainId, contractName)
+    } else {
+      return getContractAddressFor_L2_L1(chainId, contractName)
+    }
+  }
+
+  const getAvailableTokensForMode = (chainName: string) => {
+    // Get tokens from both configs and merge them
+    const l2l2Tokens = getAvailableTokensFor_L2_L2(chainName)
+    const l2l1Tokens = getAvailableTokensFor_L2_L1(chainName)
+    
+    // Merge and remove duplicates
+    const allTokens = [...l2l2Tokens, ...l2l1Tokens]
+    const uniqueTokens = [...new Set(allTokens)]
+    
+    return uniqueTokens.length > 0 ? uniqueTokens : l2l2Tokens.length > 0 ? l2l2Tokens : l2l1Tokens
+  }
+
+
+  // Validate that source and destination chains are different
+  // Trim whitespace and compare to handle any edge cases
+  const isSameChain = !!(requestFrom && requestTo && requestFrom.trim() === requestTo.trim())
+
+  // Auto-reset requestTo if it becomes the same as requestFrom
+  useEffect(() => {
+    if (requestFrom && requestTo && requestFrom.trim() === requestTo.trim()) {
+      setRequestTo('') // Reset to empty to force user to select again
+    }
+  }, [requestFrom, requestTo])
+
+  // Reset token selection when chain changes
+  useEffect(() => {
+    // Only update tokens if chains are selected
+    if (!requestFrom || !requestTo) return
+    
+    const availableSendTokens = getAvailableTokensForMode(requestFrom)
+    
+    // Reset send token if current selection is not available
+    if (!availableSendTokens.includes(sendToken) && availableSendTokens.length > 0) {
+      setSendToken(availableSendTokens[0])
+    }
+    
+    // Note: receiveToken is always the same as sendToken, no need to reset separately
+  }, [requestFrom, requestTo, sendToken])
 
   // Helper function to convert amount to wei based on token decimals
   const toTokenWei = (amount: string, tokenSymbol: string) => {
@@ -97,6 +238,78 @@ export const CreateRequest = () => {
   // Update receive amount when send amount or fee changes
   const currentReceiveAmount = calculateReceiveAmount()
 
+  // Get token address for balance checking
+  // IMPORTANT: For balance, we need the SOURCE chain's token address
+  // We should check BOTH L2_L2 and L2_L1 configs because the source chain
+  // might be configured in either one, regardless of the communication mode
+  const getSourceTokenAddress = () => {
+    // Don't try to get address if no chain is selected
+    if (!requestFrom) return undefined
+    
+    try {
+      const fromChainId = getChainIdByName(requestFrom)
+      if (!fromChainId) return undefined
+      
+      // Try L2_L2 config first
+      let tokenAddress = getTokenAddressFor_L2_L2(fromChainId, sendToken)
+      if (tokenAddress) return tokenAddress
+      
+      // If not found, try L2_L1 config
+      tokenAddress = getTokenAddressFor_L2_L1(fromChainId, sendToken)
+      if (tokenAddress) return tokenAddress
+      
+      return undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  const sourceTokenAddress = getSourceTokenAddress()
+  const isNativeTokenForBalance = sourceTokenAddress?.toLowerCase() === NATIVE_TOKEN_ADDRESS.toLowerCase()
+  
+  // Get chain ID safely for balance fetching
+  const sourceChainIdForBalance = requestFrom ? getChainIdByName(requestFrom) : undefined
+
+  // Fetch native token balance (ETH, TON, etc.)
+  const { data: nativeBalance } = useBalance({
+    address: connectedAddress,
+    chainId: sourceChainIdForBalance,
+    query: {
+      enabled: isNativeTokenForBalance && !!connectedAddress && !!sourceChainIdForBalance
+    }
+  })
+
+  // Fetch ERC20 token balance
+  const { data: erc20Balance } = useReadContract({
+    address: sourceTokenAddress as `0x${string}`,
+    abi: ERC20_ABI,
+    functionName: 'balanceOf',
+    args: connectedAddress ? [connectedAddress] : undefined,
+    chainId: sourceChainIdForBalance,
+    query: {
+      enabled: !isNativeTokenForBalance && !!connectedAddress && !!sourceTokenAddress && !!sourceChainIdForBalance
+    }
+  })
+
+  // Format balance for display
+  const formatBalance = () => {
+    if (!connectedAddress) return '0.00'
+    
+    if (isNativeTokenForBalance && nativeBalance) {
+      const decimals = getTokenDecimals(sendToken)
+      const balance = Number(nativeBalance.value) / (10 ** decimals)
+      return balance.toFixed(6)
+    } else if (!isNativeTokenForBalance && erc20Balance) {
+      const decimals = getTokenDecimals(sendToken)
+      const balance = Number(erc20Balance) / (10 ** decimals)
+      return balance.toFixed(6)
+    }
+    
+    return '0.00'
+  }
+
+  const displayBalance = formatBalance()
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     
@@ -110,11 +323,16 @@ export const CreateRequest = () => {
   }
 
   const handleConfirmRequest = async () => {
-    // If token is not ETH and not yet approved, do approval first
-    if (sendToken !== 'ETH' && !isTokenApproved) {
+    // Get the source token address to check if it's native token
+    const fromChainId = getChainIdByName(requestFrom)
+    const l2SourceTokenAddress = getTokenAddressForMode(fromChainId, sendToken)
+    const isNativeToken = l2SourceTokenAddress?.toLowerCase() === NATIVE_TOKEN_ADDRESS.toLowerCase()
+    
+    // If token is not native (0x0000...) and not yet approved, do approval first
+    if (!isNativeToken && !isTokenApproved) {
       await handleApproval()
     } else {
-      // For ETH or if already approved, go to main transaction
+      // For native tokens or if already approved, go to main transaction
       setShowConfirmModal(false)
       await handleMainTransaction()
     }
@@ -126,19 +344,24 @@ export const CreateRequest = () => {
 
     try {
       // Get all the dynamic parameters from the form state
-      const fromChainId = CHAIN_IDS[requestFrom as keyof typeof CHAIN_IDS]
-      const toChainId = CHAIN_IDS[requestTo as keyof typeof CHAIN_IDS]
+      // Get chain IDs from our configuration (mode-aware)
+      const fromChainId = getChainIdByName(requestFrom)
+      const toChainId = getChainIdByName(requestTo)
       
-      // Get token addresses for all chains
-      const l2SourceTokenAddress = getTokenAddress(fromChainId, sendToken) // Token on source chain
-      const l2DestinationTokenAddress = getTokenAddress(toChainId, receiveToken) // Token on destination chain
+      // Get token addresses for the respective chains (mode-aware)
+      const l2SourceTokenAddress = getTokenAddressForMode(fromChainId, sendToken) // Token on source chain
+      const l2DestinationTokenAddress = getTokenAddressForMode(toChainId, sendToken) // Token on destination chain (same as source)
       
-      // Get the CrossTrade contract address (this is the spender)
-      const crossTradeContractAddress = getContractAddress(11155420, 'L2_CROSS_TRADE') || CONTRACTS.L2_CROSS_TRADE
+      // Get the CrossTrade contract address (this is the spender) (mode-aware)
+      const crossTradeContractAddress = getContractAddressForMode(fromChainId, 'l2_cross_trade')
+      
+      if (!crossTradeContractAddress) {
+        throw new Error(`l2_cross_trade contract address not found for chain ${fromChainId}`)
+      }
       
       // Amount calculations with correct decimals
       const totalAmountWei = toTokenWei(sendAmount, sendToken)
-      const ctAmountWei = toTokenWei(currentReceiveAmount, receiveToken)
+      const ctAmountWei = toTokenWei(currentReceiveAmount, sendToken) // Same token as sendToken
 
       // Connected wallet info
       const connectedWallet = connectedAddress
@@ -153,7 +376,7 @@ export const CreateRequest = () => {
         
         // Token Information
         sendToken: sendToken,
-        receiveToken: receiveToken,
+        receiveToken: sendToken, // Same as sendToken
         l2SourceTokenAddress: l2SourceTokenAddress,
         l2DestinationTokenAddress: l2DestinationTokenAddress,
         
@@ -254,34 +477,27 @@ export const CreateRequest = () => {
     }
 
     try {
-      // Get chain IDs from our configuration
-      const fromChainId = CHAIN_IDS[requestFrom as keyof typeof CHAIN_IDS]
-      const toChainId = CHAIN_IDS[requestTo as keyof typeof CHAIN_IDS]
+      // Get chain IDs from our configuration (mode-aware)
+      const fromChainId = getChainIdByName(requestFrom)
+      const toChainId = getChainIdByName(requestTo)
 
-      // Get token addresses for the respective chains
-      const l1TokenAddress = getTokenAddress(11155111, sendToken) // L1 token (always Ethereum Sepolia equivalent)
-      const l2SourceTokenAddress = getTokenAddress(fromChainId, sendToken) // L2 source token (from chain)
-      const l2DestinationTokenAddress = getTokenAddress(toChainId, receiveToken) // L2 destination token (to chain)
+      // Get token addresses for the respective chains (mode-aware)
+      const l2SourceTokenAddress = getTokenAddressForMode(fromChainId, sendToken) // L2 source token (from chain)
+      const l2DestinationTokenAddress = getTokenAddressForMode(toChainId, sendToken) // L2 destination token (to chain, same as source)
 
-      // Get contract address for the current chain (assuming we're on Optimism Sepolia for now)
-      const contractAddress = getContractAddress(11155420, 'L2_CROSS_TRADE') || CONTRACTS.L2_CROSS_TRADE
-
-      console.log('Contract call parameters:', {
-        contractAddress,
-        l1TokenAddress,
-        l2SourceTokenAddress,
-        l2DestinationTokenAddress,
-        totalAmount: BigInt(Math.floor(parseFloat(sendAmount || '0') * 1e18)),
-        ctAmount: BigInt(Math.floor(parseFloat(currentReceiveAmount) * 1e18)),
-        l1ChainId: BigInt(11155111),
-        l2DestinationChainId: BigInt(toChainId)
-      })
+      // Get contract address for the current chain (mode-aware)
+      const contractAddress = getContractAddressForMode(fromChainId, 'l2_cross_trade')
+      
+      if (!contractAddress) {
+        throw new Error(`l2_cross_trade contract address not found for chain ${fromChainId}`)
+      }
 
       // Check if user is on the correct network for main transaction
       console.log('🌐 Main Transaction Network Check:', {
         currentChainId: chainId,
         requiredChainId: fromChainId,
-        needsSwitch: chainId !== fromChainId
+        needsSwitch: chainId !== fromChainId,
+        communicationMode: communicationMode
       })
       
       if (chainId !== fromChainId) {
@@ -300,23 +516,97 @@ export const CreateRequest = () => {
         }
       }
 
-      await writeContract({
-        address: contractAddress as `0x${string}`,
-        abi: L2_CROSS_TRADE_ABI,
-        functionName: 'requestRegisteredToken',
-        chainId: fromChainId, // Execute on the source chain (e.g., Optimism Sepolia)
-        args: [
-          l1TokenAddress as `0x${string}`, // l1token
-          l2SourceTokenAddress as `0x${string}`, // l2SourceToken
-          l2DestinationTokenAddress as `0x${string}`, // l2DestinationToken
-          toAddress as `0x${string}`, // _receiver (to address)
-          toTokenWei(sendAmount, sendToken), // totalAmount with correct decimals
-          toTokenWei(currentReceiveAmount, receiveToken), // ctAmount with correct decimals
-          BigInt(11155111), // l1ChainId (always Ethereum Sepolia)
-          BigInt(toChainId) // l2DestinationChainId
-        ],
-        value: sendToken === 'ETH' ? toTokenWei(sendAmount, sendToken) : BigInt(0)
-      })
+      // CRITICAL: L2_L2 and L2_L1 use DIFFERENT contracts with DIFFERENT ABIs!
+      // 
+      // L2_L2 Mode (NEW Implementation):
+      // - L2 Contract: L2toL2CrossTradeL2.sol with requestRegisteredToken(8 params)
+      // - L1 Contract: L2toL2CrossTradeL1.sol
+      // - Parameters: _l1token, _l2SourceToken, _l2DestinationToken, _receiver, _totalAmount, _ctAmount, _l1ChainId, _l2DestinationChainId
+      //
+      // L2_L1 Mode (OLD Implementation):
+      // - L2 Contract: L2CrossTrade.sol with requestRegisteredToken(6 params)
+      // - L1 Contract: L1CrossTrade.sol
+      // - Parameters: _l1token, _l2token, _receiver, _totalAmount, _ctAmount, _l1chainId
+      
+      if (communicationMode === 'L2_L2') {
+        // L2 to L2 communication: Get L1 token address from Ethereum Sepolia
+        const l1ChainId = 11155111 // Ethereum Sepolia
+        const l1TokenAddress = getTokenAddressForMode(l1ChainId, sendToken) // L1 token
+
+        console.log('📝 L2_L2 Contract call parameters:', {
+          mode: 'L2_L2',
+          contractAddress,
+          l1TokenAddress,
+          l2SourceTokenAddress,
+          l2DestinationTokenAddress,
+          fromChainId,
+          toChainId,
+          totalAmount: toTokenWei(sendAmount, sendToken).toString(),
+          ctAmount: toTokenWei(currentReceiveAmount, sendToken).toString(),
+          l1ChainId,
+          abi: 'l2_cross_trade_ABI',
+          config: 'CHAIN_CONFIG_L2_L2'
+        })
+
+        // Check if source token is native (0x0000...)
+        const isNativeToken = l2SourceTokenAddress.toLowerCase() === NATIVE_TOKEN_ADDRESS.toLowerCase()
+        
+        await writeContract({
+          address: contractAddress as `0x${string}`,
+          abi: l2_cross_trade_ABI, // Same ABI for both modes (L2toL2CrossTradeL2.sol)
+          functionName: 'requestRegisteredToken',
+          chainId: fromChainId, // Execute on the source L2 chain
+          args: [
+            l1TokenAddress as `0x${string}`, // l1token
+            l2SourceTokenAddress as `0x${string}`, // l2SourceToken
+            l2DestinationTokenAddress as `0x${string}`, // l2DestinationToken
+            toAddress as `0x${string}`, // _receiver (to address)
+            toTokenWei(sendAmount, sendToken), // totalAmount with correct decimals
+            toTokenWei(currentReceiveAmount, sendToken), // ctAmount with correct decimals (same token)
+            BigInt(l1ChainId), // l1ChainId (Ethereum Sepolia for L2_L2)
+            BigInt(toChainId) // l2DestinationChainId
+          ],
+          value: isNativeToken ? toTokenWei(sendAmount, sendToken) : BigInt(0)
+        })
+      } else {
+        // L2 to L1 communication: Uses OLD L2CrossTrade.sol contract (6 params)
+        const l1ChainId = 11155111 // Ethereum Sepolia
+        const l1TokenAddress = getTokenAddressForMode(l1ChainId, sendToken) // L1 token from L2_L1 config
+
+        console.log('📝 L2_L1 Contract call parameters:', {
+          mode: 'L2_L1',
+          contractAddress, // From L2_L1 config (OLD contract)
+          l1TokenAddress, // From L2_L1 config
+          l2SourceTokenAddress, // From L2_L1 config (used as _l2token in OLD contract)
+          fromChainId,
+          totalAmount: toTokenWei(sendAmount, sendToken).toString(),
+          ctAmount: toTokenWei(currentReceiveAmount, sendToken).toString(),
+          l1ChainId,
+          abi: 'L2_L1_REQUEST_ABI (OLD contract - 6 params)',
+          config: 'CHAIN_CONFIG_L2_L1',
+          note: 'OLD contract: requestRegisteredToken(_l1token, _l2token, _receiver, _totalAmount, _ctAmount, _l1chainId)'
+        })
+
+        // Check if source token is native (0x0000...)
+        const isNativeTokenL2L1 = l2SourceTokenAddress.toLowerCase() === NATIVE_TOKEN_ADDRESS.toLowerCase()
+        
+        // L2_L1 uses OLD L2CrossTrade.sol contract with 6 parameters
+        await writeContract({
+          address: contractAddress as `0x${string}`,
+          abi: L2_L1_REQUEST_ABI, // OLD contract ABI (6 params)
+          functionName: 'requestRegisteredToken',
+          chainId: fromChainId, // Execute on the source L2 chain
+          args: [
+            l1TokenAddress as `0x${string}`, // _l1token
+            l2SourceTokenAddress as `0x${string}`, // _l2token (only source token in OLD contract)
+            toAddress as `0x${string}`, // _receiver (to address)
+            toTokenWei(sendAmount, sendToken), // _totalAmount with correct decimals
+            toTokenWei(currentReceiveAmount, sendToken), // _ctAmount with correct decimals (same token)
+            BigInt(l1ChainId) // _l1chainId
+          ],
+          value: isNativeTokenL2L1 ? toTokenWei(sendAmount, sendToken) : BigInt(0)
+        })
+      }
     } catch (error) {
       console.error('Transaction failed:', error)
       setIsApproving(false)
@@ -388,6 +678,27 @@ export const CreateRequest = () => {
         
         <div className="form-container">
           <form onSubmit={handleSubmit} className="request-form">
+            {/* Mode Indicator */}
+            <div style={{ 
+              padding: '12px', 
+              marginBottom: '16px', 
+              borderRadius: '8px', 
+              backgroundColor: communicationMode === 'L2_L2' ? 'rgba(99, 102, 241, 0.1)' : 'rgba(34, 197, 94, 0.1)',
+              border: `1px solid ${communicationMode === 'L2_L2' ? 'rgba(99, 102, 241, 0.3)' : 'rgba(34, 197, 94, 0.3)'}`,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px'
+            }}>
+              <span style={{ fontSize: '14px', fontWeight: '600', color: '#ffffff' }}>
+                {communicationMode === 'L2_L2' ? '🔄 L2 ↔ L2 Mode' : '🌉 L2 ↔ L1 Mode'}
+              </span>
+              <span style={{ fontSize: '12px', color: 'rgba(255, 255, 255, 0.85)' }}>
+                {communicationMode === 'L2_L2' 
+                  ? 'Cross-chain transfer between Layer 2 networks' 
+                  : 'Bridge transfer from Layer 2 to Layer 1'}
+              </span>
+            </div>
+
             {/* Request From/To Section */}
             <div className="chain-selector-row">
               <div className="chain-selector">
@@ -398,9 +709,20 @@ export const CreateRequest = () => {
                     onChange={(e) => setRequestFrom(e.target.value)}
                     className="chain-select"
                   >
-                    <option value="Thanos Sepolia">🔵 Thanos Sepolia</option>
-                    <option value="Ethereum">⚪ Ethereum</option>
-                    <option value="Optimism">🔴 Optimism</option>
+                    <option value="" disabled>Select source chain...</option>
+                    {[...getChainsFor_L2_L2(), ...getChainsFor_L2_L1()]
+                      // Remove duplicates by chain ID
+                      .filter((chain, index, self) => 
+                        index === self.findIndex(c => c.chainId === chain.chainId)
+                      )
+                      // Filter out L1 chains (Ethereum) - can't initiate requests FROM L1
+                      .filter(({ chainId }) => !isL1Chain(chainId))
+                      .map(({ chainId, config }) => (
+                        <option key={chainId} value={config.display_name}>
+                          {config.display_name}
+                        </option>
+                      ))
+                    }
                   </select>
                 </div>
               </div>
@@ -417,9 +739,27 @@ export const CreateRequest = () => {
                     onChange={(e) => setRequestTo(e.target.value)}
                     className="chain-select"
                   >
-                    <option value="Optimism">🔴 Optimism</option>
-                    <option value="Thanos Sepolia">🔵 Thanos Sepolia</option>
-                    <option value="Ethereum">⚪ Ethereum</option>
+                    <option value="" disabled>Select destination chain...</option>
+                    {[...getChainsFor_L2_L2(), ...getChainsFor_L2_L1()]
+                      // Remove duplicates by chain ID
+                      .filter((chain, index, self) => 
+                        index === self.findIndex(c => c.chainId === chain.chainId)
+                      )
+                      // Filter out the source chain - can't send to the same chain
+                      .filter(({ config }) => config.display_name !== requestFrom)
+                      // Filter out L1 chains if L2_L1 config is not available
+                      .filter(({ chainId }) => {
+                        if (isL1Chain(chainId) && !isL2L1ConfigAvailable()) {
+                          return false; // Hide L1 chains when L2_L1 config is unavailable
+                        }
+                        return true;
+                      })
+                      .map(({ chainId, config }) => (
+                        <option key={chainId} value={config.display_name}>
+                          {config.display_name}
+                        </option>
+                      ))
+                    }
                   </select>
                 </div>
               </div>
@@ -443,15 +783,29 @@ export const CreateRequest = () => {
                     onChange={(e) => setSendToken(e.target.value)}
                     className="token-select"
                   >
-                    <option value="USDC">USDC</option>
-                    <option value="USDT">USDT</option>
-                    <option value="ETH">ETH</option>
-                    <option value="TON">TON</option>
+                    {getAvailableTokensForMode(requestFrom).map((token) => (
+                      <option key={token} value={token}>
+                        {token}
+                      </option>
+                    ))}
                   </select>
                   <div className="dropdown-arrow">▼</div>
                 </div>
               </div>
-              <div className="balance-info">Balance: 19.21 <span className="max-btn">Max</span></div>
+              <div className="balance-info">
+                Balance: {displayBalance} {sendToken}
+                <span 
+                  className="max-btn"
+                  onClick={() => {
+                    if (displayBalance && displayBalance !== '0.00') {
+                      setSendAmount(displayBalance)
+                    }
+                  }}
+                  style={{ cursor: 'pointer' }}
+                >
+                  Max
+                </span>
+              </div>
             </div>
 
             {/* You Receive and To Address Section */}
@@ -466,19 +820,9 @@ export const CreateRequest = () => {
                     placeholder="9.5"
                     className="amount-input readonly you-receive"
                   />
-                  <div className="token-selector">
+                  <div className="token-display">
                     <div className="token-icon">🔵</div>
-                    <select 
-                      value={receiveToken} 
-                      onChange={(e) => setReceiveToken(e.target.value)}
-                      className="token-select"
-                    >
-                      <option value="USDC">USDC</option>
-                      <option value="USDT">USDT</option>
-                      <option value="ETH">ETH</option>
-                      <option value="TON">TON</option>
-                    </select>
-                    <div className="dropdown-arrow">▼</div>
+                    <span className="token-text">{sendToken.toUpperCase()}</span>
                   </div>
                 </div>
               </div>
@@ -510,8 +854,8 @@ export const CreateRequest = () => {
                 </div>
                 <div className="fee-details">
                   <span className="fee-percentage">2.00%</span>
-                  <span className="fee-value">{calculateFee().toFixed(2)}</span>
-                  <span className="fee-token">USDC</span>
+                  <span className="fee-value">{calculateFee().toFixed(6)}</span>
+                  <span className="fee-token">{sendToken}</span>
                 </div>
               </div>
 
@@ -536,7 +880,7 @@ export const CreateRequest = () => {
                     className="fee-input"
                     onClick={(e) => e.stopPropagation()}
                   />
-                  <span className="fee-token">USDC</span>
+                  <span className="fee-token">{sendToken}</span>
                 </div>
               </div>
             </div>
@@ -545,13 +889,24 @@ export const CreateRequest = () => {
             <button 
               type={connectedAddress ? "submit" : "button"} 
               className="request-button"
+              disabled={connectedAddress && (!requestFrom || !requestTo || isSameChain)}
               onClick={connectedAddress ? undefined : () => {
                 // Trigger AppKit modal programmatically
                 const appkitButton = document.querySelector('appkit-button') as any;
                 if (appkitButton) appkitButton.click();
               }}
+              style={{ 
+                opacity: connectedAddress && (!requestFrom || !requestTo || isSameChain) ? 0.5 : 1,
+                cursor: connectedAddress && (!requestFrom || !requestTo || isSameChain) ? 'not-allowed' : 'pointer'
+              }}
             >
-              {connectedAddress ? "Request" : "Please Connect Wallet"}
+              {!connectedAddress 
+                ? "Please Connect Wallet" 
+                : !requestFrom || !requestTo 
+                  ? "Select chains to continue"
+                  : isSameChain
+                    ? "Cannot transfer to the same chain"
+                    : "Request"}
             </button>
           </form>
         </div>
@@ -589,7 +944,7 @@ export const CreateRequest = () => {
               </div>
               <div className="detail-row">
                 <span className="detail-label">Receive</span>
-                <span className="detail-value">{currentReceiveAmount} 🔵 {receiveToken}</span>
+                <span className="detail-value">{currentReceiveAmount} 🔵 {sendToken.toUpperCase()}</span>
               </div>
               <div className="detail-row">
                 <span className="detail-label">From address</span>
@@ -611,7 +966,7 @@ export const CreateRequest = () => {
                 <span className="detail-label">Service fee</span>
                 <span className="detail-value">
                   <span className="fee-badge">{serviceFeeMode === 'recommended' ? '2.00%' : ((parseFloat(customFee) || 1) / (parseFloat(sendAmount) || 1) * 100).toFixed(2) + '%'}</span>
-                  {calculateFee().toFixed(2)} {sendToken}
+                  {calculateFee().toFixed(6)} {sendToken}
                 </span>
               </div>
             </div>
@@ -628,12 +983,17 @@ export const CreateRequest = () => {
             </div>
 
             <button onClick={handleConfirmRequest} className="confirm-btn">
-              {sendToken === 'ETH' 
-                ? 'Request' 
-                : isTokenApproved 
+              {(() => {
+                const fromChainId = getChainIdByName(requestFrom)
+                const l2SourceTokenAddress = getTokenAddressForMode(fromChainId, sendToken)
+                const isNativeToken = l2SourceTokenAddress?.toLowerCase() === NATIVE_TOKEN_ADDRESS.toLowerCase()
+                
+                return isNativeToken 
                   ? 'Request' 
-                  : `Approve ${sendToken}`
-              }
+                  : isTokenApproved 
+                    ? 'Request' 
+                    : `Approve ${sendToken}`
+              })()}
             </button>
           </div>
         </div>
@@ -824,6 +1184,20 @@ export const CreateRequest = () => {
           border-color: #6366f1;
         }
 
+        .chain-select option {
+          background: #1a1a1a;
+          color: #ffffff;
+          padding: 10px 14px;
+        }
+
+        .chain-select option:hover {
+          background: #262626;
+        }
+
+        .chain-select option:disabled {
+          color: #6b7280;
+        }
+
         .amount-section {
           display: flex;
           flex-direction: column;
@@ -880,6 +1254,22 @@ export const CreateRequest = () => {
           min-width: 70px;
         }
 
+        .token-display {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 10px 12px;
+          border-left: 1px solid #333333;
+          background: #262626;
+          min-width: 70px;
+        }
+
+        .token-text {
+          color: #ffffff;
+          font-size: 14px;
+          font-weight: 600;
+        }
+
         .token-icon {
           width: 20px;
           height: 20px;
@@ -897,6 +1287,20 @@ export const CreateRequest = () => {
           appearance: none;
           cursor: pointer;
           outline: none;
+        }
+
+        .token-select option {
+          background: #1a1a1a;
+          color: #ffffff;
+          padding: 10px 14px;
+        }
+
+        .token-select option:hover {
+          background: #262626;
+        }
+
+        .token-select option:disabled {
+          color: #6b7280;
         }
 
         .dropdown-arrow {

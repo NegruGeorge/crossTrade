@@ -1,8 +1,9 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { usePublicClient, useContractRead, useAccount } from 'wagmi'
-import { CONTRACTS, L2_CROSS_TRADE_ABI, CHAIN_CONFIG, CHAIN_IDS, getTokenAddress, getContractAddress, getTokenDecimals, getAllChains } from '@/config/contracts'
+import { usePublicClient, useAccount } from 'wagmi'
+import { createPublicClient, http, defineChain } from 'viem'
+import { CHAIN_CONFIG_L2_L2, CHAIN_CONFIG_L2_L1, getTokenDecimals, getChainsFor_L2_L2, getChainsFor_L2_L1 } from '@/config/contracts'
 import { Navigation } from './Navigation'
 import { ReviewProvideModal } from './ReviewProvideModal'
 
@@ -15,6 +16,7 @@ interface RequestData {
   provider: string
   totalAmount: bigint
   ctAmount: bigint
+  editedCtAmount?: bigint // Edited amount from L1 (if edited)
   l1ChainId: bigint
   l2DestinationChainId: bigint
   hashValue: string
@@ -24,10 +26,12 @@ interface Request {
   saleCount: number
   chainId: number
   chainName: string
+  contractAddress: string
+  contractType: 'L2_L2' | 'L2_L1' // Track the type of cross-trade
   data: RequestData | null
 }
 
-const FULFILLED_KEY = 'fulfilledSaleCounts_v1'
+const FULFILLED_KEY = 'fulfilledSaleCounts_v2'
 
 export const RequestPool = () => {
   const publicClient = usePublicClient()
@@ -35,7 +39,7 @@ export const RequestPool = () => {
   const [requests, setRequests] = useState<Request[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [fulfilledSaleCounts, setFulfilledSaleCounts] = useState<Set<number>>(() => {
+  const [fulfilledSaleCounts, setFulfilledSaleCounts] = useState<Set<string>>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem(FULFILLED_KEY)
       if (saved) return new Set(JSON.parse(saved))
@@ -45,18 +49,116 @@ export const RequestPool = () => {
   const [forceRefresh, setForceRefresh] = useState(false)
   const [selectedRequest, setSelectedRequest] = useState<Request | null>(null)
   const [isProvideModalOpen, setIsProvideModalOpen] = useState(false)
+  const [selectedToken, setSelectedToken] = useState<string>('ALL')
+  const [selectedChain, setSelectedChain] = useState<string>('ALL')
 
-  // Get all L2 chains that have L2_CROSS_TRADE contracts
+  // Get all L2 chains that have l2_cross_trade contracts (both L2_L2 and L2_L1)
   const getL2Chains = () => {
-    const allChains = getAllChains()
-    return allChains.filter(({ chainId, config }) => 
-      config.contracts.L2_CROSS_TRADE && 
-      config.contracts.L2_CROSS_TRADE !== '' &&
+    const l2l2Chains = getChainsFor_L2_L2().filter(({ chainId, config }) => 
+      config.contracts.l2_cross_trade && 
+      config.contracts.l2_cross_trade !== '' &&
       chainId !== 11155111 // Exclude Ethereum Sepolia (L1)
-    )
+    ).map(chain => ({ ...chain, type: 'L2_L2' as const }))
+    
+    const l2l1Chains = getChainsFor_L2_L1().filter(({ chainId, config }) => 
+      config.contracts.l2_cross_trade && 
+      config.contracts.l2_cross_trade !== '' &&
+      chainId !== 11155111 // Exclude Ethereum Sepolia (L1)
+    ).map(chain => ({ ...chain, type: 'L2_L1' as const }))
+    
+    return [...l2l2Chains, ...l2l1Chains]
   }
 
   const l2Chains = getL2Chains()
+
+  // Generate random color for icons
+  const generateRandomColor = (seed: string) => {
+    const colors = ['🔵', '🟢', '🟡', '🟠', '🔴', '🟣', '🟤', '⚫', '⚪', '🔘']
+    let hash = 0
+    for (let i = 0; i < seed.length; i++) {
+      hash = seed.charCodeAt(i) + ((hash << 5) - hash)
+    }
+    return colors[Math.abs(hash) % colors.length]
+  }
+
+  // Get all unique tokens from all chain configs
+  const getAllUniqueTokens = () => {
+    const tokenSet = new Set<string>()
+    const tokenMap: { [key: string]: { symbol: string; emoji: string; addresses: string[] } } = {}
+    
+    // Collect from L2_L2 config
+    Object.entries(CHAIN_CONFIG_L2_L2).forEach(([chainId, config]) => {
+      Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+        if (address && address !== '') {
+          // tokenSymbol is already normalized to uppercase at load time
+          if (!tokenMap[tokenSymbol]) {
+            tokenMap[tokenSymbol] = {
+              symbol: tokenSymbol,
+              emoji: generateRandomColor(tokenSymbol),
+              addresses: []
+            }
+          }
+          if (!tokenMap[tokenSymbol].addresses.includes(address.toLowerCase())) {
+            tokenMap[tokenSymbol].addresses.push(address.toLowerCase())
+          }
+        }
+      })
+    })
+    
+    // Collect from L2_L1 config
+    Object.entries(CHAIN_CONFIG_L2_L1).forEach(([chainId, config]) => {
+      Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+        if (address && address !== '') {
+          // tokenSymbol is already normalized to uppercase at load time
+          if (!tokenMap[tokenSymbol]) {
+            tokenMap[tokenSymbol] = {
+              symbol: tokenSymbol,
+              emoji: generateRandomColor(tokenSymbol),
+              addresses: []
+            }
+          }
+          if (!tokenMap[tokenSymbol].addresses.includes(address.toLowerCase())) {
+            tokenMap[tokenSymbol].addresses.push(address.toLowerCase())
+          }
+        }
+      })
+    })
+    
+    return Object.values(tokenMap)
+  }
+
+  // Get all unique chains with emojis (includes L1 for L2_L1 rewards)
+  const getAllUniqueChains = () => {
+    const chainMap: { [key: string]: { id: number; name: string; emoji: string } } = {}
+    
+    // Add all L2 chains
+    l2Chains.forEach(({ chainId, config }) => {
+      if (!chainMap[chainId.toString()]) {
+        chainMap[chainId.toString()] = {
+          id: chainId,
+          name: config.display_name,
+          emoji: generateRandomColor(config.display_name)
+        }
+      }
+    })
+    
+    // Add L1 (Ethereum) for L2_L1 rewards
+    // Check both L2_L2 and L2_L1 configs for Ethereum Sepolia (11155111)
+    const l1ChainId = 11155111
+    const l1Config = CHAIN_CONFIG_L2_L2[l1ChainId.toString()] || CHAIN_CONFIG_L2_L1[l1ChainId.toString()]
+    if (l1Config) {
+      chainMap[l1ChainId.toString()] = {
+        id: l1ChainId,
+        name: l1Config.display_name,
+        emoji: generateRandomColor(l1Config.display_name)
+      }
+    }
+    
+    return Object.values(chainMap)
+  }
+
+  const allTokens = getAllUniqueTokens()
+  const allChains = getAllUniqueChains()
 
   // Helper function to format token amounts with proper decimals
   const formatTokenAmount = (amount: bigint, tokenAddress: string) => {
@@ -64,15 +166,27 @@ export const RequestPool = () => {
     let symbol = 'UNKNOWN'
     let decimals = 18
 
-    // Check against known token addresses
-    Object.entries(CHAIN_CONFIG).forEach(([chainId, config]) => {
+    // Check against known token addresses from both L2_L2 and L2_L1 configs
+    Object.entries(CHAIN_CONFIG_L2_L2).forEach(([chainId, config]) => {
       Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
-        if (address.toLowerCase() === tokenAddress.toLowerCase()) {
-          symbol = tokenSymbol
+        if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
+          symbol = tokenSymbol // Already normalized to uppercase at load time
           decimals = getTokenDecimals(tokenSymbol)
         }
       })
     })
+    
+    // Also check L2_L1 config if not found
+    if (symbol === 'UNKNOWN') {
+      Object.entries(CHAIN_CONFIG_L2_L1).forEach(([chainId, config]) => {
+        Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+          if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
+            symbol = tokenSymbol // Already normalized to uppercase at load time
+            decimals = getTokenDecimals(tokenSymbol)
+          }
+        })
+      })
+    }
 
     const divisor = BigInt(10 ** decimals)
     const integerPart = amount / divisor
@@ -90,39 +204,101 @@ export const RequestPool = () => {
   // Helper function to get chain name from chain ID
   const getChainName = (chainId: bigint) => {
     const chainIdNum = Number(chainId)
-    const config = CHAIN_CONFIG[chainIdNum as keyof typeof CHAIN_CONFIG]
-    return config?.displayName || `Chain ${chainId}`
+    const chainIdStr = chainIdNum.toString()
+    // Try L2_L2 config first, then L2_L1
+    const config = CHAIN_CONFIG_L2_L2[chainIdStr] || CHAIN_CONFIG_L2_L1[chainIdStr]
+    return config?.display_name || `Chain ${chainId}`
   }
 
-  // Helper function to get chain emoji
+  // Helper function to get chain emoji (uses dynamic mapping)
   const getChainEmoji = (chainName: string) => {
-    switch (chainName) {
-      case 'Optimism': return '🔴'
-      case 'GeorgeChain': return '🟣'
-      case 'MonicaChain': return '🟢'
-      case 'Thanos': return '🔵'
-      case 'Ethereum': return '⚪'
-      default: return '⚫'
-    }
+    const chain = allChains.find(c => c.name === chainName)
+    return chain?.emoji || '⚫'
   }
 
-  // Helper function to get token emoji
+  // Helper function to get token emoji (uses dynamic mapping)
   const getTokenEmoji = (tokenAddress: string) => {
-    let symbol = 'UNKNOWN'
-    Object.entries(CHAIN_CONFIG).forEach(([chainId, config]) => {
-      Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
-        if (address.toLowerCase() === tokenAddress.toLowerCase()) {
-          symbol = tokenSymbol
-        }
-      })
+    const normalizedAddress = tokenAddress.toLowerCase()
+    const token = allTokens.find(t => t.addresses.includes(normalizedAddress))
+    return token?.emoji || '🔘'
+  }
+
+  // Helper function to create chain-specific publicClient
+  const getPublicClientForChain = (chainId: number) => {
+    // Get RPC URL from config
+    const chainIdStr = chainId.toString()
+    const configL2L2 = CHAIN_CONFIG_L2_L2[chainIdStr]
+    const configL2L1 = CHAIN_CONFIG_L2_L1[chainIdStr]
+    
+    const rpcUrl = configL2L2?.rpc_url || configL2L1?.rpc_url
+    
+    if (!rpcUrl) {
+      throw new Error(`No RPC URL configured for chain ${chainId}`)
+    }
+
+    const chainConfig = defineChain({
+      id: chainId,
+      name: `Chain ${chainId}`,
+      nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+      rpcUrls: {
+        default: { http: [rpcUrl] }
+      }
     })
 
-    switch (symbol) {
-      case 'USDC': return '🔵'
-      case 'USDT': return '🟢'
-      case 'ETH': return '⚪'
-      case 'TON': return '💎'
-      default: return '🔘'
+    return createPublicClient({
+      chain: chainConfig,
+      transport: http(rpcUrl)
+    })
+  }
+
+  // Helper function to get edited ctAmount from L1 contract
+  const getEditedCtAmount = async (hashValue: string, contractType: 'L2_L2' | 'L2_L1'): Promise<bigint | null> => {
+    try {
+      // L1 is always Ethereum Sepolia (chainId 11155111)
+      const l1ChainId = 11155111
+      
+      // Get L1 contract address based on contract type
+      let l1ContractAddress: string | undefined
+      
+      if (contractType === 'L2_L2') {
+        // For L2_L2, use CHAIN_CONFIG_L2_L2 to get l1_cross_trade address
+        const l1Config = CHAIN_CONFIG_L2_L2[l1ChainId]
+        l1ContractAddress = l1Config?.contracts.l1_cross_trade
+      } else {
+        // For L2_L1, use CHAIN_CONFIG_L2_L1 to get l1_cross_trade address
+        const l1Config = CHAIN_CONFIG_L2_L1[l1ChainId]
+        l1ContractAddress = l1Config?.contracts.l1_cross_trade
+      }
+      
+      if (!l1ContractAddress) {
+        console.warn(`L1 contract address not found for ${contractType}`)
+        return null
+      }
+
+      // Create L1-specific client
+      const l1Client = getPublicClientForChain(l1ChainId)
+      
+      // Query editCtAmount mapping
+      const editedAmount = await l1Client.readContract({
+        address: l1ContractAddress as `0x${string}`,
+        abi: [
+          {
+            inputs: [{ type: 'bytes32', name: '' }],
+            name: 'editCtAmount',
+            outputs: [{ type: 'uint256', name: '' }],
+            stateMutability: 'view',
+            type: 'function',
+          },
+        ],
+        functionName: 'editCtAmount',
+        args: [hashValue as `0x${string}`],
+      }) as bigint
+
+      // Return edited amount if it's non-zero, otherwise null
+      return editedAmount > BigInt(0) ? editedAmount : null
+    } catch (err) {
+      console.error('Error fetching edited ctAmount from L1:', err)
+      return null
     }
   }
 
@@ -134,7 +310,9 @@ export const RequestPool = () => {
 
     try {
       const allRequestsArray: Request[] = []
-      let newFulfilled = new Set<number>(fullRefresh ? [] : Array.from(fulfilledSaleCounts))
+      let newFulfilled = new Set<string>(fullRefresh ? [] : Array.from(fulfilledSaleCounts))
+
+        console.log('🚀 [RequestPool] Starting fetch, l2Chains:', l2Chains)
 
         // Get all possible destination chain IDs (all L2 chains + L1)
         const allDestinationChainIds = [
@@ -143,59 +321,177 @@ export const RequestPool = () => {
         ]
 
         // Fetch requests from all L2 chains
-        for (const { chainId: sourceChainId, config } of l2Chains) {
-          const contractAddress = config.contracts.L2_CROSS_TRADE
-          if (!contractAddress || contractAddress === '') continue
-
+        for (const { chainId: sourceChainId, config, type: contractType } of l2Chains) {
+          console.log(`🔄 [RequestPool] Processing chain ${sourceChainId} (${config.display_name}) - Type: ${contractType}`)
+          const contractAddress = config.contracts.l2_cross_trade
+          if (!contractAddress || contractAddress === '') {
+            console.log(`⚠️ [RequestPool] No contract address for chain ${sourceChainId}, skipping`)
+            continue
+          }
 
           try {
-            // For each source chain, check requests going to all possible destinations
-            for (const destinationChainId of allDestinationChainIds) {
+            if (contractType === 'L2_L2') {
+              // L2_L2 contract: has separate saleCountChainId per destination
+              console.log(`📍 [${config.display_name}] Checking destinations:`, allDestinationChainIds)
+              
+              // Create a chain-specific client for this L2 source chain
+              const l2Client = getPublicClientForChain(sourceChainId)
+              
+              for (const destinationChainId of allDestinationChainIds) {
+                try {
+                  // Get the current saleCount for requests going to this destination
+                  console.log(`🔍 [${config.display_name} -> ${destinationChainId}] Calling saleCountChainId...`)
+                  
+                  const currentSaleCount = await l2Client.readContract({
+                    address: contractAddress as `0x${string}`,
+                    abi: [
+                      {
+                        inputs: [{ type: 'uint256', name: 'chainId' }],
+                        name: 'saleCountChainId',
+                        outputs: [{ type: 'uint256', name: '' }],
+                        stateMutability: 'view',
+                        type: 'function',
+                      },
+                    ],
+                    functionName: 'saleCountChainId',
+                    args: [BigInt(destinationChainId)],
+                  }) as bigint
+
+                  const totalRequests = Number(currentSaleCount)
+                  console.log(`📊 [${config.display_name} -> ${destinationChainId}] Found ${totalRequests} requests`)
+
+                  // Fetch individual requests for this source->destination pair
+                  for (let saleCount = 1; saleCount <= totalRequests; saleCount++) {
+                    const requestKey = `${contractAddress}_${destinationChainId}_${saleCount}`
+                    if (!fullRefresh && fulfilledSaleCounts.has(requestKey)) continue // skip known fulfilled
+                    
+                    try {
+                      const data = await l2Client.readContract({
+                        address: contractAddress as `0x${string}`,
+                        abi: [
+                          {
+                            inputs: [
+                              { type: 'uint256', name: 'chainId' },
+                              { type: 'uint256', name: 'saleCount' }
+                            ],
+                            name: 'dealData',
+                            outputs: [
+                              { type: 'address', name: 'l1token' },
+                              { type: 'address', name: 'l2SourceToken' },
+                              { type: 'address', name: 'l2DestinationToken' },
+                              { type: 'address', name: 'requester' },
+                              { type: 'address', name: 'receiver' },
+                              { type: 'address', name: 'provider' },
+                              { type: 'uint256', name: 'totalAmount' },
+                              { type: 'uint256', name: 'ctAmount' },
+                              { type: 'uint256', name: 'l1ChainId' },
+                              { type: 'uint256', name: 'l2DestinationChainId' },
+                              { type: 'bytes32', name: 'hashValue' },
+                            ],
+                            stateMutability: 'view',
+                            type: 'function',
+                          },
+                        ],
+                        functionName: 'dealData',
+                        args: [BigInt(destinationChainId), BigInt(saleCount)],
+                      }) as readonly [string, string, string, string, string, string, bigint, bigint, bigint, bigint, string]
+
+                      // Convert the tuple to RequestData object
+                      const requestData: RequestData = {
+                        l1token: data[0],
+                        l2SourceToken: data[1],
+                        l2DestinationToken: data[2],
+                        requester: data[3],
+                        receiver: data[4],
+                        provider: data[5],
+                        totalAmount: data[6],
+                        ctAmount: data[7],
+                        l1ChainId: data[8],
+                        l2DestinationChainId: data[9],
+                        hashValue: data[10],
+                      }
+
+                      // If provider is not zero address, it's fulfilled
+                      if (requestData.provider !== '0x0000000000000000000000000000000000000000') {
+                        newFulfilled.add(requestKey)
+                        continue // skip fulfilled
+                      }
+
+                      // Check for edited ctAmount on L1
+                      const editedCtAmount = await getEditedCtAmount(requestData.hashValue, 'L2_L2')
+                      if (editedCtAmount) {
+                        console.log(`📝 Found edited ctAmount for hash ${requestData.hashValue}: ${editedCtAmount.toString()}`)
+                        requestData.editedCtAmount = editedCtAmount
+                      }
+
+                      // Add request if it has a valid totalAmount (includes native token transfers where l1token is 0x0000...)
+                      if (requestData.totalAmount > BigInt(0)) {
+                        allRequestsArray.push({ 
+                          saleCount, 
+                          chainId: sourceChainId, 
+                          chainName: config.display_name,
+                          contractAddress: contractAddress,
+                          contractType: 'L2_L2',
+                          data: requestData 
+                        })
+                      }
+                    } catch (err) {
+                      console.error(`Error fetching L2_L2 request ${saleCount} from ${config.display_name} to ${destinationChainId}:`, err)
+                    }
+                  }
+                } catch (err: any) {
+                  // Log all errors to help debug
+                  console.error(`❌ [${config.display_name} -> ${destinationChainId}] Error:`, err?.message || err)
+                }
+              }
+            } else if (contractType === 'L2_L1') {
+              // L2_L1 contract: has single saleCount for all requests
               try {
-                // Get the current saleCount for requests going to this destination
-                const currentSaleCount = await publicClient.readContract({
+                // Create a chain-specific client for this L2 chain
+                const l2Client = getPublicClientForChain(sourceChainId)
+                
+                // Get the total saleCount (not per destination)
+                const currentSaleCount = await l2Client.readContract({
                   address: contractAddress as `0x${string}`,
                   abi: [
                     {
-                      inputs: [{ type: 'uint256', name: 'chainId' }],
-                      name: 'saleCountChainId',
+                      inputs: [],
+                      name: 'saleCount',
                       outputs: [{ type: 'uint256', name: '' }],
                       stateMutability: 'view',
                       type: 'function',
                     },
                   ],
-                  functionName: 'saleCountChainId',
-                  args: [BigInt(destinationChainId)],
+                  functionName: 'saleCount',
                 }) as bigint
 
                 const totalRequests = Number(currentSaleCount)
+                console.log(`📍 [L2_L1] Total requests: ${totalRequests}`)
 
-                // Fetch individual requests for this source->destination pair
+                // Fetch all requests and filter by destination
                 for (let saleCount = 1; saleCount <= totalRequests; saleCount++) {
-                  const requestKey = `${sourceChainId}_${destinationChainId}_${saleCount}`
-                  if (!fullRefresh && fulfilledSaleCounts.has(Number(requestKey))) continue // skip known fulfilled
+                  const requestKey = `${contractAddress}_all_${saleCount}`
+                  if (!fullRefresh && fulfilledSaleCounts.has(requestKey)) {
+                    continue // skip known fulfilled
+                  }
                   
                   try {
-                    const data = await publicClient.readContract({
+                    console.log(`📦 [L2_L1] Fetching dealData for request ${saleCount}`)
+                    const data = await l2Client.readContract({
                       address: contractAddress as `0x${string}`,
                       abi: [
                         {
-                          inputs: [
-                            { type: 'uint256', name: 'chainId' },
-                            { type: 'uint256', name: 'saleCount' }
-                          ],
+                          inputs: [{ type: 'uint256', name: 'saleCount' }],
                           name: 'dealData',
                           outputs: [
                             { type: 'address', name: 'l1token' },
-                            { type: 'address', name: 'l2SourceToken' },
-                            { type: 'address', name: 'l2DestinationToken' },
+                            { type: 'address', name: 'l2token' },
                             { type: 'address', name: 'requester' },
                             { type: 'address', name: 'receiver' },
                             { type: 'address', name: 'provider' },
                             { type: 'uint256', name: 'totalAmount' },
                             { type: 'uint256', name: 'ctAmount' },
-                            { type: 'uint256', name: 'l1ChainId' },
-                            { type: 'uint256', name: 'l2DestinationChainId' },
+                            { type: 'uint256', name: 'chainId' },
                             { type: 'bytes32', name: 'hashValue' },
                           ],
                           stateMutability: 'view',
@@ -203,54 +499,70 @@ export const RequestPool = () => {
                         },
                       ],
                       functionName: 'dealData',
-                      args: [BigInt(destinationChainId), BigInt(saleCount)],
-                    }) as readonly [string, string, string, string, string, string, bigint, bigint, bigint, bigint, string]
+                      args: [BigInt(saleCount)],
+                    }) as readonly [string, string, string, string, string, bigint, bigint, bigint, string]
 
                     // Convert the tuple to RequestData object
+                    // For L2_L1: l2token is both source and destination, chainId is L1 destination
                     const requestData: RequestData = {
                       l1token: data[0],
                       l2SourceToken: data[1],
-                      l2DestinationToken: data[2],
-                      requester: data[3],
-                      receiver: data[4],
-                      provider: data[5],
-                      totalAmount: data[6],
-                      ctAmount: data[7],
-                      l1ChainId: data[8],
-                      l2DestinationChainId: data[9],
-                      hashValue: data[10],
+                      l2DestinationToken: data[1], // Same as source for L2_L1
+                      requester: data[2],
+                      receiver: data[3],
+                      provider: data[4],
+                      totalAmount: data[5],
+                      ctAmount: data[6],
+                      l1ChainId: data[7], // This is the destination L1 chain
+                      l2DestinationChainId: data[7], // Store as destination for consistency
+                      hashValue: data[8],
                     }
+
+                    console.log(`📋 [L2_L1] Parsed request ${saleCount}:`, requestData)
 
                     // If provider is not zero address, it's fulfilled
                     if (requestData.provider !== '0x0000000000000000000000000000000000000000') {
-                      newFulfilled.add(Number(requestKey))
+                      newFulfilled.add(requestKey)
                       continue // skip fulfilled
                     }
 
-                    // Only add if there's actual data (not empty request)
-                    if (requestData.l1token !== '0x0000000000000000000000000000000000000000') {
+                    // Check for edited ctAmount on L1
+                    const editedCtAmount = await getEditedCtAmount(requestData.hashValue, 'L2_L1')
+                    if (editedCtAmount) {
+                      console.log(`📝 Found edited ctAmount for hash ${requestData.hashValue}: ${editedCtAmount.toString()}`)
+                      requestData.editedCtAmount = editedCtAmount
+                    }
+
+                    // Add request if it has a valid totalAmount (includes native token transfers where l2SourceToken is 0x0000...)
+                    if (requestData.totalAmount > BigInt(0)) {
+                      console.log(`✨ [L2_L1] Adding request ${saleCount} to pool`)
                       allRequestsArray.push({ 
                         saleCount, 
                         chainId: sourceChainId, 
-                        chainName: config.displayName,
+                        chainName: config.display_name,
+                        contractAddress: contractAddress,
+                        contractType: 'L2_L1',
                         data: requestData 
                       })
+                    } else {
+                      console.log(`⚠️ [L2_L1] Request ${saleCount} has zero totalAmount, skipping`)
                     }
                   } catch (err) {
-                    console.error(`Error fetching request ${saleCount} from ${config.displayName} to ${destinationChainId}:`, err)
+                    console.error(`❌ [L2_L1] Error fetching request ${saleCount} from ${config.display_name}:`, err)
                   }
                 }
               } catch (err) {
-                console.error(`Error fetching saleCount from ${config.displayName} to ${destinationChainId}:`, err)
+                console.error(`Error fetching L2_L1 saleCount from ${config.display_name}:`, err)
               }
             }
         } catch (err) {
-          console.error(`Error fetching from ${config.displayName}:`, err)
+          console.error(`Error fetching from ${config.display_name}:`, err)
         }
       }
 
       // Sort by sale count descending (newest first)
       const sortedRequests = allRequestsArray.sort((a, b) => b.saleCount - a.saleCount)
+      console.log(`🎯 [RequestPool] Total requests found: ${sortedRequests.length}`, sortedRequests)
       setRequests(sortedRequests)
       
       // Update fulfilled cache
@@ -316,7 +628,7 @@ export const RequestPool = () => {
         
         {/* Debug info - show which chains are being queried */}
         <div className="debug-info">
-          <p>Querying {l2Chains.length} L2 chains: {l2Chains.map(chain => chain.config.displayName).join(', ')}</p>
+          <p>Querying {l2Chains.length} L2 chains: {l2Chains.map(chain => `${chain.config.display_name} (${chain.type})`).join(', ')}</p>
         </div>
         
         <div className="pool-container">
@@ -344,21 +656,72 @@ export const RequestPool = () => {
             <div className="filter-section">
               <span className="filter-label">Token</span>
               <div className="filter-buttons">
-                <button className="filter-btn active">ALL</button>
-                <button className="filter-btn">🔵 USDC</button>
-                <button className="filter-btn">🟢 USDT</button>
-                <button className="filter-btn">⚪ ETH</button>
-                <button className="filter-btn">💎 TON</button>
+                <button 
+                  className={`filter-btn ${selectedToken === 'ALL' ? 'active' : ''}`}
+                  onClick={() => setSelectedToken('ALL')}
+                >
+                  ALL
+                </button>
+                {allTokens.slice(0, 3).map((token) => (
+                  <button 
+                    key={token.symbol}
+                    className={`filter-btn ${selectedToken === token.symbol ? 'active' : ''}`}
+                    onClick={() => setSelectedToken(token.symbol)}
+                  >
+                    {token.emoji} {token.symbol}
+                  </button>
+                ))}
+                {allTokens.length > 3 && (
+                  <div className="dropdown-wrapper">
+                    <select 
+                      className={`filter-dropdown ${selectedToken !== 'ALL' && !allTokens.slice(0, 3).find(t => t.symbol === selectedToken) ? 'active' : ''}`}
+                      value={selectedToken !== 'ALL' && !allTokens.slice(0, 3).find(t => t.symbol === selectedToken) ? selectedToken : ''}
+                      onChange={(e) => e.target.value && setSelectedToken(e.target.value)}
+                    >
+                      <option value="">More...</option>
+                      {allTokens.map((token) => (
+                        <option key={token.symbol} value={token.symbol}>
+                          {token.emoji} {token.symbol}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
               </div>
             </div>
             
             <div className="filter-section">
               <span className="filter-label">Reward On</span>
               <div className="filter-buttons">
-                <button className="filter-btn active">All</button>
-                <button className="filter-btn">🔵 Thanos</button>
-                <button className="filter-btn">🔴 Optimism</button>
-                <button className="filter-btn">🟢 Monica</button>
+                <button 
+                  className={`filter-btn ${selectedChain === 'ALL' ? 'active' : ''}`}
+                  onClick={() => setSelectedChain('ALL')}
+                >
+                  ALL
+                </button>
+                {allChains.slice(0, 2).map((chain) => (
+                  <button 
+                    key={chain.id}
+                    className={`filter-btn ${selectedChain === chain.name ? 'active' : ''}`}
+                    onClick={() => setSelectedChain(chain.name)}
+                  >
+                    {chain.emoji} {chain.name}
+                  </button>
+                ))}
+                <div className="dropdown-wrapper">
+                  <select 
+                    className={`filter-dropdown ${selectedChain !== 'ALL' && !allChains.slice(0, 2).find(c => c.name === selectedChain) ? 'active' : ''}`}
+                    value={selectedChain !== 'ALL' && !allChains.slice(0, 2).find(c => c.name === selectedChain) ? selectedChain : ''}
+                    onChange={(e) => e.target.value && setSelectedChain(e.target.value)}
+                  >
+                    <option value="">More...</option>
+                    {allChains.map((chain) => (
+                      <option key={chain.id} value={chain.name}>
+                        {chain.emoji} {chain.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
             </div>
           </div>
@@ -375,29 +738,60 @@ export const RequestPool = () => {
 
             {/* Table Rows */}
             <div className="table-body">
-              {requests.filter(req => req.data !== null).map((request, index) => {
+              {requests
+                .filter(req => req.data !== null)
+                .filter(req => {
+                  if (!req.data) return false
+                  
+                  // Filter by token
+                  if (selectedToken !== 'ALL') {
+                    const tokenData = allTokens.find(t => t.symbol === selectedToken)
+                    if (tokenData) {
+                      const requestTokenAddress = req.data.l2SourceToken.toLowerCase()
+                      if (!tokenData.addresses.includes(requestTokenAddress)) {
+                        return false
+                      }
+                    }
+                  }
+                  
+                  // Filter by chain (reward on = source chain where request originated)
+                  if (selectedChain !== 'ALL') {
+                    if (req.chainName !== selectedChain) {
+                      return false
+                    }
+                  }
+                  
+                  return true
+                })
+                .map((request, index) => {
                 const data = request.data!
                 const destinationChain = getChainName(data.l2DestinationChainId)
-                const totalAmount = formatTokenAmount(data.totalAmount, data.l2SourceToken)
-                const rewardAmount = formatTokenAmount(data.ctAmount, data.l2DestinationToken)
-                const serviceFeeBigInt = data.totalAmount - data.ctAmount
+                // Use edited amount if available, otherwise use original ctAmount
+                const actualCtAmount = data.editedCtAmount || data.ctAmount
+                // Provider PROVIDES actualCtAmount on L1 (Ethereum)
+                const provideAmount = formatTokenAmount(actualCtAmount, data.l2SourceToken)
+                // Provider GETS REWARDED totalAmount on L2 source chain (where request came from)
+                const rewardAmount = formatTokenAmount(data.totalAmount, data.l2SourceToken)
+                const serviceFeeBigInt = data.totalAmount - actualCtAmount
                 const serviceFeeAmount = formatTokenAmount(serviceFeeBigInt, data.l2SourceToken)
                 const profitPercentage = ((Number(serviceFeeBigInt) / Number(data.totalAmount)) * 100).toFixed(2)
 
                 return (
-                  <div key={`request-${request.chainId}-${request.saleCount}`} className="table-row">
+                  <div key={`request-${request.contractAddress}-${request.saleCount}`} className="table-row">
                     {/* Token Column */}
                     <div className="table-cell token-col">
                       <div className="token-info">
                         <span className="token-icon">{getTokenEmoji(data.l2SourceToken)}</span>
-                        <span className="token-symbol">USDC</span>
+                        <span className="token-symbol">
+                          {allTokens.find(t => t.addresses.includes(data.l2SourceToken.toLowerCase()))?.symbol || 'UNKNOWN'}
+                        </span>
                       </div>
                     </div>
 
-                    {/* Provide On Column */}
+                    {/* Provide On Column - Provider sends ctAmount on Ethereum (L1) */}
                     <div className="table-cell provide-col">
                       <div className="amount-info">
-                        <span className="amount-value">{totalAmount}</span>
+                        <span className="amount-value">{provideAmount}</span>
                         <div className="chain-info">
                           <span className="chain-icon">⚪</span>
                           <span className="chain-name">Ethereum</span>
@@ -405,14 +799,14 @@ export const RequestPool = () => {
                       </div>
                     </div>
 
-                    {/* Reward On Column */}
+                    {/* Reward On Column - Provider gets totalAmount on source L2 chain */}
                     <div className="table-cell reward-col">
                       <div className="amount-info">
                         <span className="amount-value">{rewardAmount}</span>
                         <span className="profit-badge">+{profitPercentage}%</span>
                         <div className="chain-info">
-                          <span className="chain-icon">{getChainEmoji(destinationChain)}</span>
-                          <span className="chain-name">{destinationChain}</span>
+                          <span className="chain-icon">{getChainEmoji(request.chainName)}</span>
+                          <span className="chain-name">{request.chainName}</span>
                         </div>
                       </div>
                     </div>
@@ -483,6 +877,7 @@ export const RequestPool = () => {
             receiver: selectedRequest.data.receiver,
             totalAmount: selectedRequest.data.totalAmount,
             ctAmount: selectedRequest.data.ctAmount,
+            editedCtAmount: selectedRequest.data.editedCtAmount,
             l1ChainId: selectedRequest.data.l1ChainId,
             l2DestinationChainId: selectedRequest.data.l2DestinationChainId,
             hashValue: selectedRequest.data.hashValue,
@@ -605,6 +1000,7 @@ export const RequestPool = () => {
           display: flex;
           gap: 8px;
           flex-wrap: wrap;
+          align-items: center;
         }
 
         .filter-btn {
@@ -617,6 +1013,9 @@ export const RequestPool = () => {
           font-weight: 500;
           cursor: pointer;
           transition: all 0.2s ease;
+          height: 28px;
+          display: inline-flex;
+          align-items: center;
         }
 
         .filter-btn:hover {
@@ -628,6 +1027,68 @@ export const RequestPool = () => {
           background: #6366f1;
           border-color: #6366f1;
           color: #ffffff;
+        }
+
+        .dropdown-wrapper {
+          position: relative;
+          display: inline-flex;
+          align-items: center;
+        }
+
+        .filter-dropdown {
+          background: rgba(26, 26, 26, 0.8);
+          border: 1px solid #333333;
+          border-radius: 20px;
+          padding: 6px 28px 6px 12px;
+          color: #9ca3af;
+          font-size: 12px;
+          font-weight: 500;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          appearance: none;
+          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+          background-repeat: no-repeat;
+          background-position: right 8px center;
+          height: 28px;
+          display: inline-flex;
+          align-items: center;
+        }
+
+        .filter-dropdown:hover {
+          border-color: #6366f1;
+          color: #ffffff;
+        }
+
+        .filter-dropdown:focus {
+          outline: none;
+          border-color: #6366f1;
+          color: #ffffff;
+        }
+
+        .filter-dropdown.active {
+          background: #6366f1;
+          border-color: #6366f1;
+          color: #ffffff;
+          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23ffffff' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+          background-repeat: no-repeat;
+          background-position: right 8px center;
+        }
+
+        .filter-dropdown.active:hover {
+          background: #5855eb;
+          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23ffffff' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+          background-repeat: no-repeat;
+          background-position: right 8px center;
+        }
+
+        .filter-dropdown option {
+          background: #1a1a1a;
+          color: #ffffff;
+          padding: 10px 14px;
+        }
+
+        .filter-dropdown option:hover {
+          background: #262626;
         }
 
         .table-container {

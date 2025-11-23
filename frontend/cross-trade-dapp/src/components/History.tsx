@@ -3,7 +3,21 @@
 import { useEffect, useState } from 'react'
 import { useAccount, usePublicClient, useContractRead } from 'wagmi'
 import { createPublicClient, http, defineChain } from 'viem'
-import { CONTRACTS, CHAIN_CONFIG, getTokenDecimals, getAllChains, getContractAddress } from '@/config/contracts'
+import { 
+  CHAIN_CONFIG_L2_L2,
+  CHAIN_CONFIG_L2_L1, 
+  getTokenDecimals, 
+  // L2_L2 specific imports
+  getChainsFor_L2_L2,
+  getContractAddressFor_L2_L2,
+  // L2_L1 specific imports
+  getChainsFor_L2_L1,
+  getContractAddressFor_L2_L1,
+  // L2_L1 ABIs
+  L2_L1_PROVIDE_CT_ABI,
+  L2_L1_CANCEL_CT_ABI,
+  L2_L1_EDIT_FEE_ABI
+} from '@/config/contracts'
 import { Navigation } from './Navigation'
 import { EditFeeModal } from './EditFeeModal'
 import { CancelCTModal } from './CancelCTModal'
@@ -17,6 +31,7 @@ interface RequestData {
   provider: string
   totalAmount: bigint
   ctAmount: bigint
+  editedCtAmount?: bigint // Edited amount from L1 (if edited)
   l1ChainId: bigint
   l2DestinationChainId: bigint
   hashValue: string
@@ -42,32 +57,65 @@ export const History = () => {
   const [isEditModalOpen, setIsEditModalOpen] = useState(false)
   const [isCancelModalOpen, setIsCancelModalOpen] = useState(false)
 
-  // Get all L2 chains that have L2_CROSS_TRADE contracts
+  // Get all L2 chains that have l2_cross_trade contracts from both L2_L2 and L2_L1 configs
   const getL2Chains = () => {
-    const allChains = getAllChains()
-    return allChains.filter(({ chainId, config }) => 
-      config.contracts.L2_CROSS_TRADE && 
-      config.contracts.L2_CROSS_TRADE !== '' &&
+    // Get chains from both configs
+    const l2l2Chains = getChainsFor_L2_L2().filter(({ chainId, config }) => 
+      config.contracts.l2_cross_trade && 
+      config.contracts.l2_cross_trade !== '' &&
       chainId !== 11155111 // Exclude Ethereum Sepolia (L1)
-    )
+    ).map(chain => ({ ...chain, type: 'L2_L2' as const }))
+    
+    const l2l1Chains = getChainsFor_L2_L1().filter(({ chainId, config }) => 
+      config.contracts.l2_cross_trade && 
+      config.contracts.l2_cross_trade !== '' &&
+      chainId !== 11155111 // Exclude Ethereum Sepolia (L1)
+    ).map(chain => ({ ...chain, type: 'L2_L1' as const }))
+    
+    // Combine both types
+    const allChains = [...l2l2Chains, ...l2l1Chains]
+    
+    console.log('📊 History - L2 Chains loaded:', {
+      l2l2Count: l2l2Chains.length,
+      l2l1Count: l2l1Chains.length,
+      totalCount: allChains.length,
+      chains: allChains.map(c => ({ chainId: c.chainId, name: c.config.display_name, type: c.type }))
+    })
+    
+    return allChains
   }
 
   const l2Chains = getL2Chains()
 
+  // Helper function to determine communication mode based on destination chain
+  const getCommunicationMode = (destinationChainId: number): 'L2_L2' | 'L2_L1' => {
+    const l1ChainId = 11155111 // Ethereum Sepolia
+    return destinationChainId === l1ChainId ? 'L2_L1' : 'L2_L2'
+  }
+
+  // Mode-aware helper to get contract address
+  const getContractAddressForMode = (chainId: number, contractName: string, destinationChainId: number) => {
+    const mode = getCommunicationMode(destinationChainId)
+    
+    // Each mode strictly uses its own config - no fallbacks
+    if (mode === 'L2_L2') {
+      return getContractAddressFor_L2_L2(chainId, contractName)
+    } else {
+      return getContractAddressFor_L2_L1(chainId, contractName)
+    }
+  }
+
   // Helper function to create chain-specific publicClient
   const getPublicClientForChain = (chainId: number) => {
-    // Define chain configurations with RPC endpoints
-    const getRpcUrl = (chainId: number) => {
-      switch (chainId) {
-        case 11155420: // Optimism Sepolia
-          return 'https://sepolia.optimism.io'
-        case 111551119090: // Thanos Sepolia  
-          return 'https://rpc.thanos-sepolia.tokamak.network'
-        case 11155111: // Ethereum Sepolia
-          return 'https://ethereum-sepolia-rpc.publicnode.com'
-        default:
-          return 'https://ethereum-sepolia-rpc.publicnode.com'
-      }
+    // Get RPC URL from config
+    const chainIdStr = chainId.toString()
+    const configL2L2 = CHAIN_CONFIG_L2_L2[chainIdStr]
+    const configL2L1 = CHAIN_CONFIG_L2_L1[chainIdStr]
+    
+    const rpcUrl = configL2L2?.rpc_url || configL2L1?.rpc_url
+    
+    if (!rpcUrl) {
+      throw new Error(`No RPC URL configured for chain ${chainId}`)
     }
 
     // Create a dedicated publicClient for this specific chain
@@ -76,13 +124,13 @@ export const History = () => {
       name: `Chain ${chainId}`,
       nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
       rpcUrls: {
-        default: { http: [getRpcUrl(chainId)] }
+        default: { http: [rpcUrl] }
       }
     })
 
     return createPublicClient({
       chain: chainConfig,
-      transport: http(getRpcUrl(chainId))
+      transport: http(rpcUrl)
     })
   }
 
@@ -91,15 +139,27 @@ export const History = () => {
     let symbol = 'UNKNOWN'
     let decimals = 18
 
-    // Check against known token addresses
-    Object.entries(CHAIN_CONFIG).forEach(([chainId, config]) => {
+    // Check against known token addresses from both L2_L2 and L2_L1 configs
+    Object.entries(CHAIN_CONFIG_L2_L2).forEach(([chainId, config]) => {
       Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
-        if (address.toLowerCase() === tokenAddress.toLowerCase()) {
+        if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
           symbol = tokenSymbol
           decimals = getTokenDecimals(tokenSymbol)
         }
       })
     })
+    
+    // Also check L2_L1 config if not found
+    if (symbol === 'UNKNOWN') {
+      Object.entries(CHAIN_CONFIG_L2_L1).forEach(([chainId, config]) => {
+        Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+          if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
+            symbol = tokenSymbol
+            decimals = getTokenDecimals(tokenSymbol)
+          }
+        })
+      })
+    }
 
     const divisor = BigInt(10 ** decimals)
     const integerPart = amount / divisor
@@ -117,8 +177,10 @@ export const History = () => {
   // Helper function to get chain name from chain ID
   const getChainName = (chainId: bigint) => {
     const chainIdNum = Number(chainId)
-    const config = CHAIN_CONFIG[chainIdNum as keyof typeof CHAIN_CONFIG]
-    return config?.displayName || `Chain ${chainId}`
+    const chainIdStr = chainIdNum.toString()
+    // Try L2_L2 config first, then L2_L1
+    const config = CHAIN_CONFIG_L2_L2[chainIdStr] || CHAIN_CONFIG_L2_L1[chainIdStr]
+    return config?.display_name || `Chain ${chainId}`
   }
 
   // Helper function to get chain emoji
@@ -136,13 +198,24 @@ export const History = () => {
   // Helper function to get token symbol from address
   const getTokenSymbol = (tokenAddress: string) => {
     let symbol = 'UNKNOWN'
-    Object.entries(CHAIN_CONFIG).forEach(([chainId, config]) => {
+    // Check L2_L2 config
+    Object.entries(CHAIN_CONFIG_L2_L2).forEach(([chainId, config]) => {
       Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
-        if (address.toLowerCase() === tokenAddress.toLowerCase()) {
+        if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
           symbol = tokenSymbol
         }
       })
     })
+    // Also check L2_L1 config if not found
+    if (symbol === 'UNKNOWN') {
+      Object.entries(CHAIN_CONFIG_L2_L1).forEach(([chainId, config]) => {
+        Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+          if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
+            symbol = tokenSymbol
+          }
+        })
+      })
+    }
     return symbol
   }
 
@@ -154,6 +227,57 @@ export const History = () => {
       case 'ETH': return '⚪'
       case 'TON': return '💎'
       default: return '🔘'
+    }
+  }
+
+  // Helper function to get edited ctAmount from L1 contract
+  const getEditedCtAmount = async (hashValue: string, contractType: 'L2_L2' | 'L2_L1'): Promise<bigint | null> => {
+    try {
+      // L1 is always Ethereum Sepolia (chainId 11155111)
+      const l1ChainId = 11155111
+      
+      // Get L1 contract address based on contract type
+      let l1ContractAddress: string | undefined
+      
+      if (contractType === 'L2_L2') {
+        // For L2_L2, use CHAIN_CONFIG_L2_L2 to get l1_cross_trade address
+        const l1Config = CHAIN_CONFIG_L2_L2[l1ChainId]
+        l1ContractAddress = l1Config?.contracts.l1_cross_trade
+      } else {
+        // For L2_L1, use CHAIN_CONFIG_L2_L1 to get l1_cross_trade address
+        const l1Config = CHAIN_CONFIG_L2_L1[l1ChainId]
+        l1ContractAddress = l1Config?.contracts.l1_cross_trade
+      }
+      
+      if (!l1ContractAddress) {
+        console.warn(`L1 contract address not found for ${contractType}`)
+        return null
+      }
+
+      // Create L1-specific client
+      const l1Client = getPublicClientForChain(l1ChainId)
+      
+      // Query editCtAmount mapping
+      const editedAmount = await l1Client.readContract({
+        address: l1ContractAddress as `0x${string}`,
+        abi: [
+          {
+            inputs: [{ type: 'bytes32', name: '' }],
+            name: 'editCtAmount',
+            outputs: [{ type: 'uint256', name: '' }],
+            stateMutability: 'view',
+            type: 'function',
+          },
+        ],
+        functionName: 'editCtAmount',
+        args: [hashValue as `0x${string}`],
+      }) as bigint
+
+      // Return edited amount if it's non-zero, otherwise null
+      return editedAmount > BigInt(0) ? editedAmount : null
+    } catch (err) {
+      console.error('Error fetching edited ctAmount from L1:', err)
+      return null
     }
   }
 
@@ -193,64 +317,178 @@ export const History = () => {
         11155111 // Ethereum Sepolia (L1)
       ]
 
-      // Fetch history from all L2 chains - COPY EXACT LOGIC FROM REQUESTPOOL
-      for (const { chainId: sourceChainId, config } of l2Chains) {
-        const contractAddress = config.contracts.L2_CROSS_TRADE
+      // Fetch history from all L2 chains - Handle both L2_L2 and L2_L1
+      for (const { chainId: sourceChainId, config, type: contractType } of l2Chains) {
+        const contractAddress = config.contracts.l2_cross_trade
         if (!contractAddress || contractAddress === '') continue
 
-try {
-          // For each source chain, check requests going to all possible destinations
-          for (const destinationChainId of allDestinationChainIds) {
+        try {
+          if (contractType === 'L2_L2') {
+            // L2_L2 contract: has separate saleCountChainId per destination
+            for (const destinationChainId of allDestinationChainIds) {
+              try {
+                // Create chain-specific publicClient for this contract call
+                const chainSpecificClient = getPublicClientForChain(sourceChainId)
+                
+                const currentSaleCount = await chainSpecificClient.readContract({
+                  address: contractAddress as `0x${string}`,
+                  abi: [
+                    {
+                      inputs: [{ type: 'uint256', name: 'chainId' }],
+                      name: 'saleCountChainId',
+                      outputs: [{ type: 'uint256', name: '' }],
+                      stateMutability: 'view',
+                      type: 'function',
+                    },
+                  ],
+                  functionName: 'saleCountChainId',
+                  args: [BigInt(destinationChainId)],
+                }) as bigint
+
+                const totalRequests = Number(currentSaleCount)
+
+                // Fetch individual requests for this source->destination pair
+                for (let saleCount = 1; saleCount <= totalRequests; saleCount++) {
+                  try {
+                    // Use the same chain-specific client for consistency
+                    const chainSpecificClient = getPublicClientForChain(sourceChainId)
+                    
+                    const data = await chainSpecificClient.readContract({
+                      address: contractAddress as `0x${string}`,
+                      abi: [
+                        {
+                          inputs: [
+                            { type: 'uint256', name: 'chainId' },
+                            { type: 'uint256', name: 'saleCount' }
+                          ],
+                          name: 'dealData',
+                          outputs: [
+                            { type: 'address', name: 'l1token' },
+                            { type: 'address', name: 'l2SourceToken' },
+                            { type: 'address', name: 'l2DestinationToken' },
+                            { type: 'address', name: 'requester' },
+                            { type: 'address', name: 'receiver' },
+                            { type: 'address', name: 'provider' },
+                            { type: 'uint256', name: 'totalAmount' },
+                            { type: 'uint256', name: 'ctAmount' },
+                            { type: 'uint256', name: 'l1ChainId' },
+                            { type: 'uint256', name: 'l2DestinationChainId' },
+                            { type: 'bytes32', name: 'hashValue' },
+                          ],
+                          stateMutability: 'view',
+                          type: 'function',
+                        },
+                      ],
+                      functionName: 'dealData',
+                      args: [BigInt(destinationChainId), BigInt(saleCount)],
+                    }) as readonly [string, string, string, string, string, string, bigint, bigint, bigint, bigint, string]
+
+                    // Convert the tuple to RequestData object
+                    const requestData: RequestData = {
+                      l1token: data[0],
+                      l2SourceToken: data[1],
+                      l2DestinationToken: data[2],
+                      requester: data[3],
+                      receiver: data[4],
+                      provider: data[5],
+                      totalAmount: data[6],
+                      ctAmount: data[7],
+                      l1ChainId: data[8],
+                      l2DestinationChainId: data[9],
+                      hashValue: data[10],
+                    }
+
+                    // Check if user is involved (as requester or provider)
+                    const isRequester = requestData.requester.toLowerCase() === userAddress.toLowerCase()
+                    const isProvider = requestData.provider.toLowerCase() === userAddress.toLowerCase() && 
+                                      requestData.provider !== '0x0000000000000000000000000000000000000000'
+
+                    if (isRequester || isProvider) {
+                      // Check for edited ctAmount on L1
+                      const editedCtAmount = await getEditedCtAmount(requestData.hashValue, 'L2_L2')
+                      if (editedCtAmount) {
+                        console.log(`📝 Found edited ctAmount for hash ${requestData.hashValue}: ${editedCtAmount.toString()}`)
+                        requestData.editedCtAmount = editedCtAmount
+                      }
+
+                      // Determine status based on provider
+                      let status: 'Completed' | 'Waiting' | 'Cancelled'
+                      if (requestData.provider !== '0x0000000000000000000000000000000000000000') {
+                        // Check if provider equals receiver - this indicates cancellation
+                        if (requestData.provider.toLowerCase() === requestData.receiver.toLowerCase()) {
+                          status = 'Cancelled'
+                        } else {
+                          status = 'Completed'
+                        }
+                      } else {
+                        status = 'Waiting'
+                      }
+
+                      userHistory.push({
+                        saleCount,
+                        chainId: sourceChainId,
+                        chainName: config.display_name,
+                        data: requestData,
+                        status,
+                        type: isProvider ? 'Provide' : 'Request',
+                      })
+                    }
+                  } catch (err) {
+                    // Silently skip if dealData function doesn't exist or returns no data
+                    if ((err as any)?.message?.includes('returned no data')) {
+                      continue
+                    }
+                  }
+                }
+              } catch (err) {
+                // Silently skip if saleCountChainId function doesn't exist
+                if ((err as any)?.message?.includes('returned no data') || (err as any)?.message?.includes('saleCountChainId')) {
+                  continue
+                }
+              }
+            }
+          } else if (contractType === 'L2_L1') {
+            // L2_L1 contract: has single saleCount for all requests
             try {
-              // Create chain-specific publicClient for this contract call
               const chainSpecificClient = getPublicClientForChain(sourceChainId)
               
+              // Get the total saleCount (not per destination)
               const currentSaleCount = await chainSpecificClient.readContract({
                 address: contractAddress as `0x${string}`,
                 abi: [
                   {
-                    inputs: [{ type: 'uint256', name: 'chainId' }],
-                    name: 'saleCountChainId',
+                    inputs: [],
+                    name: 'saleCount',
                     outputs: [{ type: 'uint256', name: '' }],
                     stateMutability: 'view',
                     type: 'function',
                   },
                 ],
-                functionName: 'saleCountChainId',
-                args: [BigInt(destinationChainId)],
+                functionName: 'saleCount',
               }) as bigint
-
 
               const totalRequests = Number(currentSaleCount)
 
-              // Fetch individual requests for this source->destination pair
+              // Fetch all requests
               for (let saleCount = 1; saleCount <= totalRequests; saleCount++) {
                 try {
-                  console.log(`🔍 HISTORY DEBUG: Calling dealData(${destinationChainId}, ${saleCount}) on ${config.displayName} contract ${contractAddress}`)
-                  
-                  // Use the same chain-specific client for consistency
                   const chainSpecificClient = getPublicClientForChain(sourceChainId)
                   
                   const data = await chainSpecificClient.readContract({
                     address: contractAddress as `0x${string}`,
                     abi: [
                       {
-                        inputs: [
-                          { type: 'uint256', name: 'chainId' },
-                          { type: 'uint256', name: 'saleCount' }
-                        ],
+                        inputs: [{ type: 'uint256', name: 'saleCount' }],
                         name: 'dealData',
                         outputs: [
                           { type: 'address', name: 'l1token' },
-                          { type: 'address', name: 'l2SourceToken' },
-                          { type: 'address', name: 'l2DestinationToken' },
+                          { type: 'address', name: 'l2token' },
                           { type: 'address', name: 'requester' },
                           { type: 'address', name: 'receiver' },
                           { type: 'address', name: 'provider' },
                           { type: 'uint256', name: 'totalAmount' },
                           { type: 'uint256', name: 'ctAmount' },
-                          { type: 'uint256', name: 'l1ChainId' },
-                          { type: 'uint256', name: 'l2DestinationChainId' },
+                          { type: 'uint256', name: 'chainId' },
                           { type: 'bytes32', name: 'hashValue' },
                         ],
                         stateMutability: 'view',
@@ -258,22 +496,23 @@ try {
                       },
                     ],
                     functionName: 'dealData',
-                    args: [BigInt(destinationChainId), BigInt(saleCount)],
-                  }) as readonly [string, string, string, string, string, string, bigint, bigint, bigint, bigint, string]
+                    args: [BigInt(saleCount)],
+                  }) as readonly [string, string, string, string, string, bigint, bigint, bigint, string]
 
-// Convert the tuple to RequestData object
+                  // Convert the tuple to RequestData object
+                  // For L2_L1: l2token is both source and destination, chainId is L1 destination
                   const requestData: RequestData = {
                     l1token: data[0],
                     l2SourceToken: data[1],
-                    l2DestinationToken: data[2],
-                    requester: data[3],
-                    receiver: data[4],
-                    provider: data[5],
-                    totalAmount: data[6],
-                    ctAmount: data[7],
-                    l1ChainId: data[8],
-                    l2DestinationChainId: data[9],
-                    hashValue: data[10],
+                    l2DestinationToken: data[1], // Same as source for L2_L1
+                    requester: data[2],
+                    receiver: data[3],
+                    provider: data[4],
+                    totalAmount: data[5],
+                    ctAmount: data[6],
+                    l1ChainId: data[7], // This is the destination L1 chain
+                    l2DestinationChainId: data[7], // Store as destination for consistency
+                    hashValue: data[8],
                   }
 
                   // Check if user is involved (as requester or provider)
@@ -281,7 +520,14 @@ try {
                   const isProvider = requestData.provider.toLowerCase() === userAddress.toLowerCase() && 
                                     requestData.provider !== '0x0000000000000000000000000000000000000000'
 
-if (isRequester || isProvider) {
+                  if (isRequester || isProvider) {
+                    // Check for edited ctAmount on L1
+                    const editedCtAmount = await getEditedCtAmount(requestData.hashValue, 'L2_L1')
+                    if (editedCtAmount) {
+                      console.log(`📝 Found edited ctAmount for hash ${requestData.hashValue}: ${editedCtAmount.toString()}`)
+                      requestData.editedCtAmount = editedCtAmount
+                    }
+
                     // Determine status based on provider
                     let status: 'Completed' | 'Waiting' | 'Cancelled'
                     if (requestData.provider !== '0x0000000000000000000000000000000000000000') {
@@ -292,13 +538,13 @@ if (isRequester || isProvider) {
                         status = 'Completed'
                       }
                     } else {
-                      status = 'Waiting' // Real status: waiting for provider
+                      status = 'Waiting'
                     }
 
                     userHistory.push({
                       saleCount,
                       chainId: sourceChainId,
-                      chainName: config.displayName,
+                      chainName: config.display_name,
                       data: requestData,
                       status,
                       type: isProvider ? 'Provide' : 'Request',
@@ -312,14 +558,15 @@ if (isRequester || isProvider) {
                 }
               }
             } catch (err) {
-              // Silently skip if saleCountChainId function doesn't exist or returns no data
-              // This is expected for contracts that don't have requests for this destination chain
-              if ((err as any)?.message?.includes('returned no data')) {
+              // Silently skip if saleCount function doesn't exist
+              if ((err as any)?.message?.includes('returned no data') || (err as any)?.message?.includes('saleCount')) {
                 continue
               }
             }
           }
         } catch (err) {
+          // Outer catch for any unexpected errors
+          console.error(`Error fetching from ${config.display_name}:`, err)
         }
       }
 
@@ -395,7 +642,7 @@ if (isRequester || isProvider) {
         
         {/* Debug info - show which chains are being queried */}
         <div className="debug-info">
-          <p>Querying {l2Chains.length} L2 chains: {l2Chains.map(chain => chain.config.displayName).join(', ')}</p>
+          <p>Querying {l2Chains.length} L2 chains: {l2Chains.map(chain => `${chain.config.display_name} (${chain.type})`).join(', ')}</p>
         </div>
         
         <div className="history-wrapper">
@@ -461,7 +708,9 @@ if (isRequester || isProvider) {
                     const data = request.data!
                     const tokenSymbol = getTokenSymbol(data.l2SourceToken)
                     const tokenEmoji = getTokenEmoji(tokenSymbol)
-                    const amount = formatTokenAmount(data.totalAmount, data.l2SourceToken)
+                    // Use edited amount if available, otherwise use original ctAmount
+                    const actualCtAmount = data.editedCtAmount || data.ctAmount
+                    const amount = formatTokenAmount(actualCtAmount, data.l2SourceToken)
                     const fromChain = request.type === 'Provide' 
                       ? getChainName(BigInt(11155111)) // Ethereum for provides
                       : request.chainName // Source chain from request data
@@ -560,6 +809,7 @@ if (isRequester || isProvider) {
             receiver: selectedRequest.data.receiver,
             totalAmount: selectedRequest.data.totalAmount,
             ctAmount: selectedRequest.data.ctAmount,
+            editedCtAmount: selectedRequest.data.editedCtAmount,
             l1ChainId: selectedRequest.data.l1ChainId,
             l2SourceChainId: selectedRequest.chainId, // The actual source chain where request was created
             l2DestinationChainId: selectedRequest.data.l2DestinationChainId,
@@ -582,6 +832,7 @@ if (isRequester || isProvider) {
             receiver: selectedRequest.data.receiver,
             totalAmount: selectedRequest.data.totalAmount,
             ctAmount: selectedRequest.data.ctAmount,
+            editedCtAmount: selectedRequest.data.editedCtAmount,
             l1ChainId: selectedRequest.data.l1ChainId,
             l2SourceChainId: selectedRequest.chainId, // The actual source chain where request was created
             l2DestinationChainId: selectedRequest.data.l2DestinationChainId,

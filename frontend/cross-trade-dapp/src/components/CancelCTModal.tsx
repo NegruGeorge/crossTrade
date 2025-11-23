@@ -1,8 +1,18 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useWriteContract, useWaitForTransactionReceipt, useAccount, useChainId, useSwitchChain } from 'wagmi'
-import { CANCEL_CT_ABI, getTokenDecimals, getContractAddress, getAllChains } from '@/config/contracts'
+import { 
+  CANCEL_CT_ABI, 
+  getTokenDecimals, 
+  CHAIN_CONFIG_L2_L2,
+  CHAIN_CONFIG_L2_L1,
+  // L2_L2 specific imports
+  getContractAddressFor_L2_L2,
+  // L2_L1 specific imports
+  getContractAddressFor_L2_L1,
+  L2_L1_CANCEL_CT_ABI
+} from '@/config/contracts'
 
 interface CancelCTModalProps {
   isOpen: boolean
@@ -16,6 +26,7 @@ interface CancelCTModalProps {
     receiver: string
     totalAmount: bigint
     ctAmount: bigint
+    editedCtAmount?: bigint
     l1ChainId: bigint
     l2SourceChainId: number  // The actual source chain where request was created
     l2DestinationChainId: bigint
@@ -36,21 +47,57 @@ export const CancelCTModal = ({ isOpen, onClose, requestData }: CancelCTModalPro
     hash: cancelHash,
   })
 
+  // Detect communication mode based on destination chain
+  const communicationMode = useMemo((): 'L2_L2' | 'L2_L1' => {
+    const destinationChainId = Number(requestData.l2DestinationChainId)
+    const l1ChainId = 11155111 // Ethereum Sepolia
+    
+    // If destination is Ethereum (L1) → L2_L1, otherwise → L2_L2
+    return destinationChainId === l1ChainId ? 'L2_L1' : 'L2_L2'
+  }, [requestData.l2DestinationChainId])
+
+  // Get the correct ABI based on communication mode
+  const getCancelABI = () => {
+    return communicationMode === 'L2_L1' ? L2_L1_CANCEL_CT_ABI : CANCEL_CT_ABI
+  }
+
+  // Get the correct L1 contract address based on mode
+  const getL1ContractAddress = () => {
+    const l1ChainId = 11155111 // Ethereum Sepolia
+    
+    if (communicationMode === 'L2_L1') {
+      return getContractAddressFor_L2_L1(l1ChainId, 'l1_cross_trade')
+    } else {
+      return getContractAddressFor_L2_L2(l1ChainId, 'l1_cross_trade')
+    }
+  }
+
   // Helper function to format token amounts with proper decimals using dynamic config
   const formatTokenAmount = (amount: bigint, tokenAddress: string) => {
     let symbol = 'UNKNOWN'
     let decimals = 18
-    const allChains = getAllChains()
 
-    // Check against known token addresses using dynamic config
-    allChains.forEach(({ chainId, config }) => {
+    // Check against known token addresses from both L2_L2 and L2_L1 configs
+    Object.entries(CHAIN_CONFIG_L2_L2).forEach(([chainId, config]) => {
       Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
-        if (address.toLowerCase() === tokenAddress.toLowerCase()) {
+        if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
           symbol = tokenSymbol
           decimals = getTokenDecimals(tokenSymbol)
         }
       })
     })
+    
+    // Also check L2_L1 config if not found
+    if (symbol === 'UNKNOWN') {
+      Object.entries(CHAIN_CONFIG_L2_L1).forEach(([chainId, config]) => {
+        Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+          if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
+            symbol = tokenSymbol
+            decimals = getTokenDecimals(tokenSymbol)
+          }
+        })
+      })
+    }
 
     const divisor = BigInt(10 ** decimals)
     const integerPart = amount / divisor
@@ -68,15 +115,26 @@ export const CancelCTModal = ({ isOpen, onClose, requestData }: CancelCTModalPro
   // Helper function to get token symbol from address using dynamic config
   const getTokenSymbol = (tokenAddress: string) => {
     let symbol = 'UNKNOWN'
-    const allChains = getAllChains()
     
-    allChains.forEach(({ chainId, config }) => {
+    // Check L2_L2 config
+    Object.entries(CHAIN_CONFIG_L2_L2).forEach(([chainId, config]) => {
       Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
-        if (address.toLowerCase() === tokenAddress.toLowerCase()) {
+        if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
           symbol = tokenSymbol
         }
       })
     })
+    
+    // Also check L2_L1 config if not found
+    if (symbol === 'UNKNOWN') {
+      Object.entries(CHAIN_CONFIG_L2_L1).forEach(([chainId, config]) => {
+        Object.entries(config.tokens).forEach(([tokenSymbol, address]) => {
+          if (address && address.toLowerCase() === tokenAddress.toLowerCase()) {
+            symbol = tokenSymbol
+          }
+        })
+      })
+    }
     
     return symbol
   }
@@ -101,15 +159,24 @@ export const CancelCTModal = ({ isOpen, onClose, requestData }: CancelCTModalPro
     setIsSubmitting(true)
 
     try {
-      // Get L1 contract address using dynamic configuration
+      // Get L1 contract address using mode-aware configuration
       const requiredChainId = 11155111 // Ethereum Sepolia
-      const l1ContractAddress = getContractAddress(requiredChainId, 'L1_CROSS_TRADE')
+      const l1ContractAddress = getL1ContractAddress()
 
       if (!l1ContractAddress || l1ContractAddress === '0x0000000000000000000000000000000000000000') {
         alert('L1 contract address not configured. Please contact support.')
         setIsSubmitting(false)
         return
       }
+
+      console.log('🔴 CancelCTModal - Cancel request:', {
+        mode: communicationMode,
+        l1ContractAddress,
+        abi: communicationMode === 'L2_L1' ? 'L2_L1_CANCEL_CT_ABI' : 'CANCEL_CT_ABI',
+        destinationChainId: requestData.l2DestinationChainId.toString(),
+        sourceChainId: requestData.l2SourceChainId,
+        saleCount: requestData.saleCount
+      })
 
       // Check if we need to switch to L1 (Ethereum Sepolia)
       if (chainId !== requiredChainId) {
@@ -136,11 +203,15 @@ export const CancelCTModal = ({ isOpen, onClose, requestData }: CancelCTModalPro
         throw new Error(`Permission denied: Only the requester can cancel requests. Requester: ${requestData.requester}, Connected: ${userAddress}`)
       }
 
-      await writeCancelCT({
-        address: l1ContractAddress as `0x${string}`,
-        abi: CANCEL_CT_ABI,
-        functionName: 'cancel',
-        args: [
+      // Use mode-aware ABI and arguments
+      const cancelABI = getCancelABI()
+      
+      // Build arguments based on communication mode
+      let contractArgs: any
+      
+      if (communicationMode === 'L2_L2') {
+        // NEW contract (L2toL2CrossTradeL1.sol) - 11 params
+        contractArgs = [
           requestData.l1token as `0x${string}`,
           requestData.l2SourceToken as `0x${string}`,
           requestData.l2DestinationToken as `0x${string}`,
@@ -148,11 +219,39 @@ export const CancelCTModal = ({ isOpen, onClose, requestData }: CancelCTModalPro
           requestData.totalAmount,
           requestData.ctAmount,
           BigInt(requestData.saleCount),
-          BigInt(requestData.l2SourceChainId), // Source chain where request was created
-          requestData.l2DestinationChainId,
+          BigInt(requestData.l2SourceChainId), // _l2SourceChainId
+          requestData.l2DestinationChainId, // _l2DestinationChainId
           200000, // _minGasLimit
           requestData.hashValue as `0x${string}`
-        ],
+        ] as const
+      } else {
+        // OLD contract (L1CrossTrade.sol) - 9 params
+        contractArgs = [
+          requestData.l1token as `0x${string}`,
+          requestData.l2SourceToken as `0x${string}`, // Used as _l2token in OLD contract
+          requestData.receiver as `0x${string}`,
+          requestData.totalAmount,
+          requestData.ctAmount,
+          BigInt(requestData.saleCount),
+          BigInt(requestData.l2SourceChainId), // _l2chainId (source chain in OLD contract)
+          200000, // _minGasLimit
+          requestData.hashValue as `0x${string}`
+        ] as const
+      }
+      
+      console.log('🔴 CancelCTModal - Cancel CT:', {
+        mode: communicationMode,
+        abi: communicationMode === 'L2_L1' ? 'L2_L1_CANCEL_CT_ABI (9 params)' : 'CANCEL_CT_ABI (11 params)',
+        l1ContractAddress,
+        saleCount: requestData.saleCount,
+        argsCount: contractArgs.length
+      })
+
+      await writeCancelCT({
+        address: l1ContractAddress as `0x${string}`,
+        abi: cancelABI,
+        functionName: 'cancel',
+        args: contractArgs,
         chainId: requiredChainId
       })
     } catch (error) {
@@ -186,6 +285,27 @@ export const CancelCTModal = ({ isOpen, onClose, requestData }: CancelCTModalPro
         </div>
 
         <div className="modal-body">
+          {/* Mode Indicator */}
+          <div style={{ 
+            padding: '10px 12px', 
+            marginBottom: '16px', 
+            borderRadius: '8px', 
+            backgroundColor: communicationMode === 'L2_L2' ? 'rgba(99, 102, 241, 0.1)' : 'rgba(34, 197, 94, 0.1)',
+            border: `1px solid ${communicationMode === 'L2_L2' ? 'rgba(99, 102, 241, 0.3)' : 'rgba(34, 197, 94, 0.3)'}`,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px'
+          }}>
+            <span style={{ fontSize: '13px', fontWeight: '600', color: '#ffffff' }}>
+              {communicationMode === 'L2_L2' ? '🔄 L2 ↔ L2 Mode' : '🌉 L2 ↔ L1 Mode'}
+            </span>
+            <span style={{ fontSize: '11px', color: 'rgba(255, 255, 255, 0.7)' }}>
+              {communicationMode === 'L2_L2' 
+                ? 'Using L2_L2 cancel contract' 
+                : 'Using L2_L1 cancel contract'}
+            </span>
+          </div>
+
           <div className="warning-section">
             <div className="warning-icon">⚠️</div>
             <div className="warning-text">
